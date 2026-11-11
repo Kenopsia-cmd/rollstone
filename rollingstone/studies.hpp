@@ -169,6 +169,66 @@ inline void commonNotes(std::ostream& out){
        <<"Exploratory multiple comparisons are not corrected; do not treat every 95% interval as a confirmatory test.\n"
        <<"These are educational-model outputs, not validated design values for protective structures.\n";
 }
+
+} // namespace study
+inline int runTerrainStudy(const Config& input,int count,uint32_t seed,const std::string& outputDir){
+    if(count<2)throw std::invalid_argument("Studies require at least 2 runs per scenario");
+    Config base=input;base.randomSurface=true;base.detectorX=-1.;validate(base);
+    if(base.terrain.points.size()<4)throw std::invalid_argument("Terrain study needs at least 4 control points");
+    const std::filesystem::path root=std::filesystem::u8path(outputDir);
+    std::filesystem::create_directories(root);
+    auto csv=study::open(root/"terrain_study.csv");study::summaryHeader(csv);
+    auto report=study::open(root/"terrain_findings.txt");
+    report<<"TERRAIN STUDY: horizontal extent, total relief, bench, local slope and surface materials\n";
+    study::commonNotes(report);
+    report<<"For ALL terrain scenarios, the collector follows the terrain toe (detector_x=-1).\n"
+          <<"Width scaling changes travel distance AND slope angles. Height scaling changes potential energy AND slope angles.\n"
+          <<"Bench and local-angle edits redistribute neighboring slopes while keeping endpoints fixed. These are coupled geometry effects.\n"
+          <<"Material labels are illustrative parameter sets, NOT calibrated site measurements.\n";
+    study::writeConfig(base,count,seed,root/"baseline");
+    auto baseline=runBatch(base,count,seed);study::writeRunMetrics(baseline,root/"baseline");study::stripTrajectories(baseline);
+    study::summaryRows(csv,"baseline","1.0","baseline",baseline,baseline);
+    struct Scenario{std::string factor,level,name;Config config;};
+    std::vector<Scenario> scenarios;
+    for(int percent:{80,120}){
+        const double f=percent/100.;Config width=base,height=base;
+        const double x0=base.terrain.points.front().x,z0=base.terrain.toeZ();
+        for(auto&p:width.terrain.points)p.x=x0+(p.x-x0)*f;
+        if(width.barrier.kind!=BarrierKind::None)width.barrier.x=x0+(width.barrier.x-x0)*f;
+        for(auto&p:height.terrain.points)p.z=z0+(p.z-z0)*f;
+        scenarios.push_back({"horizontal_extent",percent==80?"0.8":"1.2","width_"+std::to_string(percent),width});
+        scenarios.push_back({"total_relief",percent==80?"0.8":"1.2","height_"+std::to_string(percent),height});
+    }
+    Config bench=base;const size_t a=std::max(size_t(1),base.terrain.points.size()/2-1),b=a+1;
+    const double benchZ=.5*(bench.terrain.points[a].z+bench.terrain.points[b].z);
+    bench.terrain.points[a].z=benchZ;bench.terrain.points[b].z=benchZ;
+    scenarios.push_back({"local_bench","flat","middle_bench",bench});
+    const size_t k=std::max(size_t(1),std::min(base.terrain.points.size()-2,base.terrain.points.size()/3));
+    for(double share:{.3,.7}){
+        Config local=base;
+        const double hi=local.terrain.points[k-1].z,lo=local.terrain.points[k+1].z;
+        local.terrain.points[k].z=hi-share*(hi-lo);
+        const std::string level=share<.5?"0.3":"0.7";
+        scenarios.push_back({"local_drop_share",level,share<.5?"upper_drop_30":"upper_drop_70",local});
+    }
+    const Material rockMaterial{.015,.35,.55,1.},soilMaterial{.06,.55,.25,1.},grassMaterial{.10,.65,.20,1.};
+    for(const auto&pair:std::vector<std::pair<std::string,Material>>{{"rock",rockMaterial},{"soil",soilMaterial},{"grass",grassMaterial}}){
+        Config surface=base;surface.material=pair.second;surface.terrain.surfaces.assign(surface.terrain.points.size()-1,pair.second);
+        scenarios.push_back({"surface",pair.first,"surface_"+pair.first,surface});
+    }
+    Config layered=base;layered.terrain.surfaces.clear();
+    const size_t segments=layered.terrain.points.size()-1;
+    for(size_t i=0;i<segments;++i)layered.terrain.surfaces.push_back(i*3<segments?rockMaterial:i*3<2*segments?soilMaterial:grassMaterial);
+    scenarios.push_back({"surface","layered","surface_layered",layered});
+    for(const auto&scenario:scenarios){
+        validate(scenario.config);const auto dir=root/scenario.name;
+        study::writeConfig(scenario.config,count,seed,dir);
+        auto batch=runBatch(scenario.config,count,seed);study::writeRunMetrics(batch,dir);
+        study::summaryRows(csv,scenario.factor,scenario.level,scenario.name,batch,baseline);
+        study::describeEffects(report,scenario.name,batch,baseline);
+    }
+    report<<"\nActual edited coordinates and each segment's materials are saved in the scenario's terrain.csv.\n";
+    return int(scenarios.size()+1);
 }
 
 inline int runParameterStudy(const Config& input,int count,uint32_t seed,const std::string& outputDir){
