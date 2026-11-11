@@ -44,22 +44,35 @@ inline void validate(const Config& c){
        !finite(c.sampleInterval)||c.sampleInterval<c.dt||!finite(c.detectorX)||
        !finite(c.shapePhase))throw std::invalid_argument("Invalid simulation configuration or integration step");
     if(c.detectorX>=0&&c.detectorX<=c.terrain.points.front().x)throw std::invalid_argument("Collector must be downstream of release");
-    if(c.shape!=Shape::Sphere||c.barrier.kind!=BarrierKind::None)throw std::invalid_argument("This version supports spheres without barriers");
+    if(c.sides<3||c.sides>12)throw std::invalid_argument("Convex polygon needs 3 to 12 sides");
+    if(c.barrier.kind!=BarrierKind::None)throw std::invalid_argument("This version does not yet support barriers");
 }
 inline std::vector<Vec2> bodyVertices(const Config& c,double angle){
     std::vector<Vec2> vertices;
-    for(int i=0;i<48;++i){double a=angle+2*PI*i/48;vertices.push_back({c.radius*std::cos(a),c.radius*std::sin(a)});}
+    int count=c.shape==Shape::Sphere?48:c.sides;
+    for(int i=0;i<count;++i){double a=angle+2*PI*i/count;vertices.push_back({c.radius*std::cos(a),c.radius*std::sin(a)});}
     return vertices;
 }
-inline double supportRadius(const Config& c,double,Vec2){return c.radius;}
+inline double supportRadius(const Config& c,double angle,Vec2 normal){
+    if(c.shape==Shape::Sphere)return c.radius;
+    double support=0;for(Vec2 vertex:bodyVertices(c,angle))support=std::max(support,-dot(vertex,normal));
+    return support;
+}
 inline double kineticEnergy(const State& s){return .5*s.mass*dot(s.v,s.v)+.5*s.inertia*s.omega*s.omega;}
 inline State initialState(const Config& c){
     validate(c);State s;
     s.mass=c.density*4./3.*PI*c.radius*c.radius*c.radius;
     s.inertia=.4*s.mass*c.radius*c.radius;
+    // Polygon is a uniform 2D lamina with the same mass as the reference sphere.
+    // Its true polar inertia depends on side count and circumradius.
+    if(c.shape==Shape::Polygon)s.inertia=s.mass*c.radius*c.radius*(2+std::cos(2*PI/c.sides))/6;
     s.angle=c.shapePhase;
     double x=c.terrain.points.front().x,th=c.terrain.angle(x);
     s.p={x,c.terrain.height(x)+c.radius/std::cos(th)};
+    if(c.shape==Shape::Polygon){
+        s.p.z=-std::numeric_limits<double>::infinity();
+        for(Vec2 vertex:bodyVertices(c,s.angle))s.p.z=std::max(s.p.z,c.terrain.height(x+vertex.x)-vertex.z);
+    }
     s.v={c.initialSpeed*std::cos(th),-c.initialSpeed*std::sin(th)};
     s.omega=-c.initialSpeed/c.radius;
     return s;
@@ -78,30 +91,52 @@ inline void step(State& s,const Config& c){
     double kd=.5*1.225*m.drag*PI*c.radius*c.radius/s.mass;
     double speed=length(s.v);s.v=s.v*(1/(1+kd*speed*dt));
     s.v.z-=G*dt;s.p=s.p+s.v*dt;s.angle+=s.omega*dt;s.time+=dt;
-    double th=c.terrain.angle(s.p.x);Vec2 n{std::sin(th),std::cos(th)},t{n.z,-n.x};
-    double gap=(s.p.z-c.terrain.height(s.p.x))*n.z-c.radius;
-    bool contact=gap<=1e-6;
-    if(contact){
-        s.p=s.p+n*std::max(0.,-gap);
-        Vec2 arm=n*(-c.radius);
-        double vn=dot(s.v+rotationalVelocity(s.omega,arm),n);
-        double normalImpulse=0;
-        if(vn<0){
-            double e=vn<-.25?m.restitution:0.;
-            normalImpulse=-(1+e)*vn/effectiveInverseMass(s,arm,n);
-            impulse(s,arm,n,normalImpulse);
+    double th=c.terrain.angle(s.p.x);Vec2 n{std::sin(th),std::cos(th)};
+    struct Contact{Vec2 arm,normal;double target=0,jn=0,jt=0;Material mat;};
+    std::vector<Contact> contacts;
+    if(c.shape==Shape::Sphere){
+        double gap=(s.p.z-c.terrain.height(s.p.x))*n.z-c.radius;
+        if(gap<=1e-6){
+            s.p=s.p+n*std::max(0.,-gap);
+            contacts.push_back({n*(-c.radius),n,0,0,0,m});
         }
-        double slip=dot(s.v+rotationalVelocity(s.omega,arm),t);
-        double jt=-slip/effectiveInverseMass(s,arm,t);
-        jt=std::clamp(jt,-m.friction*normalImpulse,m.friction*normalImpulse);
-        impulse(s,arm,t,jt);
-        // Rolling resistance is a torque opposing rotation, never a forward force.
+    }else{
+        double correction=0;
+        for(Vec2 arm:bodyVertices(c,s.angle)){
+            Vec2 p=s.p+arm;double angle=c.terrain.angle(p.x);Vec2 normal{std::sin(angle),std::cos(angle)};
+            double verticalGap=p.z-c.terrain.height(p.x);
+            if(verticalGap<=1e-5){
+                Material material=c.terrain.surfaces.empty()?c.material:c.terrain.surfaces[c.terrain.segment(p.x)];
+                contacts.push_back({arm,normal,0,0,0,material});
+                correction=std::max(correction,-verticalGap);
+            }
+        }
+        s.p.z+=correction;
+    }
+    for(auto& contact:contacts){
+        double vn=dot(s.v+rotationalVelocity(s.omega,contact.arm),contact.normal);
+        contact.target=vn<-.25?-contact.mat.restitution*vn:0;
+    }
+    // Accumulated projected impulses resolve all contacting polygon vertices.
+    // Restitution target is frozen per impact, so iterations do not add bounce energy.
+    for(int iteration=0;iteration<8;++iteration)for(auto& contact:contacts){
+        Vec2 normal=contact.normal,tangent{normal.z,-normal.x};
+        double vn=dot(s.v+rotationalVelocity(s.omega,contact.arm),normal);
+        double oldJn=contact.jn;
+        contact.jn=std::max(0.,oldJn+(contact.target-vn)/effectiveInverseMass(s,contact.arm,normal));
+        impulse(s,contact.arm,normal,contact.jn-oldJn);
+        double slip=dot(s.v+rotationalVelocity(s.omega,contact.arm),tangent);
+        double oldJt=contact.jt;
+        contact.jt=std::clamp(oldJt-slip/effectiveInverseMass(s,contact.arm,tangent),-contact.mat.friction*contact.jn,contact.mat.friction*contact.jn);
+        impulse(s,contact.arm,tangent,contact.jt-oldJt);
+    }
+    if(!contacts.empty()){
         double dw=m.rollResistance*s.mass*G*n.z*c.radius*dt/s.inertia;
         s.omega=std::copysign(std::max(0.,std::abs(s.omega)-dw),s.omega);
-        if(length(s.v)<.05&&std::abs(s.omega)*c.radius<.05&&std::abs(std::tan(th))<=m.rollResistance+1e-8){
-            s.v={0,0};s.omega=0;s.moving=false;s.stopReason="stopped";
-        }
-    }
+        bool canRest=c.shape==Shape::Polygon||std::abs(std::tan(th))<=m.rollResistance+1e-8;
+        if(length(s.v)<.05&&std::abs(s.omega)*c.radius<.05&&canRest)s.restTime+=dt;else s.restTime=0;
+        if(s.restTime>.5){s.v={0,0};s.omega=0;s.moving=false;s.stopReason="stopped";}
+    }else s.restTime=0;
     if(s.p.x<c.terrain.points.front().x-20||s.p.x>std::max(c.terrain.toeX()+80.,c.detectorX+30.)){
         s.moving=false;s.stopReason="domain_exit";
     }

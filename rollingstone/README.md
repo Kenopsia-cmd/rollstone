@@ -36,3 +36,6 @@ v1.1：随机批量模拟、坡脚0–10m高度概率、路线网格概率、固
 
 ## v1.4 地形与地表研究
 命令：.\build\rollingstone.exe --terrain-study --runs 200 --seed 42。比较横向尺度、高度尺度、局部缓台/坡度、岩面/土面/草地和分层地表；输出terrain_study.csv及实际分析。--width-scale/--height-scale可调基准几何；--terrain-file可输入x_m,z_m控制点CSV。详见STUDIES.md。
+
+## v1.5 凸多边形
+示例：.\build\rollingstone.exe --batch --shape polygon --sides 8 --runs 100。采用规则凸多边形，形状会改变支撑半径、转动惯量和碰撞接触臂，不是只改变绘图。为了单独对比形状，使用与同外接半径球体相同的质量；这是二维形状对照模型。边数较少、初速较低时可能因翻滚势垒停在上部坡面，可增大--speed研究启动条件。
