@@ -27,3 +27,6 @@
 v1.1：随机批量模拟、坡脚0–10m高度概率、路线网格概率、固定种子、无图形计算、有效性检查。
 
 这是二维教学近似模型，尚未经实测标定，不能用于工程拦挡设计或安全认证。
+
+## v1.2 CSV输出
+运行 --batch 后自动生成 results 下带时间戳的目录；可用 --out 指定新的空目录。导出 height_probability.csv、route_probability.csv、runs.csv、trajectories.csv、sampled_surfaces.csv、terrain.csv、config.csv 及 summary.txt。列名含SI单位，未到达断面的值留空，不伪造为零。输出目录已有内容时拒绝覆盖。
