@@ -3,7 +3,7 @@
 // 本文件已内联全部项目自定义头文件，不需要复制任何 .hpp。
 // 外部依赖：Windows、Visual Studio C++17、EasyX（本机已经安装）。
 // Visual Studio：新建“空项目/控制台应用”，将本文件作为唯一有入口的.cpp加入，
-// 选择 x64，C++语言标准设为 ISO C++17 或更高；源文件使用 UTF-8 编码。
+// 选择 x64，支持 ISO C++17 / C++20；源文件使用 UTF-8 编码。
 // 默认运行显示中文菜单；命令行示例：
 //   rollingstone.exe --batch --runs 500 --seed 42
 //   rollingstone.exe --study --runs 200 --seed 42 --cv 0.1
@@ -29,7 +29,7 @@
 // ==================== cli.hpp ====================
 // ==================== version.hpp ====================
 #define ROCK_STAGE 3
-#define ROCK_VERSION "v1.3.1"
+#define ROCK_VERSION "v1.3.2"
 
 // ==================== simulation.hpp ====================
 // ==================== model.hpp ====================
@@ -373,15 +373,28 @@ inline std::string batchSummary(const BatchResult& b){
 #include <locale>
 
 namespace rock {
+// C++20 uses char8_t for UTF-8 strings. Keep filesystem paths encoded correctly
+// without relying on u8path(), which is deprecated in C++20.
+inline std::filesystem::path pathFromUtf8(const std::string& value) {
+#ifdef __cpp_char8_t
+    return std::filesystem::path(std::u8string(value.begin(), value.end()));
+#else
+    return std::filesystem::u8path(value);
+#endif
+}
+inline std::string pathToUtf8(const std::filesystem::path& value) {
+    const auto bytes = value.u8string();
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
 inline std::ofstream csvFile(const std::filesystem::path& p){
     std::ofstream f(p,std::ios::binary);
-    if(!f)throw std::runtime_error("Cannot write "+p.u8string());
+    if(!f)throw std::runtime_error("Cannot write "+pathToUtf8(p));
     f.imbue(std::locale::classic());f<<std::setprecision(12);return f;
 }
 inline const char* shapeName(Shape s){return s==Shape::Sphere?"sphere":"polygon";}
 inline const char* barrierName(BarrierKind k){return k==BarrierKind::None?"none":k==BarrierKind::Rigid?"rigid":"elastic";}
 inline void exportBatch(const BatchResult& b,const std::string& outputDir){
-    namespace fs=std::filesystem;const auto out=fs::u8path(outputDir);
+    namespace fs=std::filesystem;const auto out=pathFromUtf8(outputDir);
     if(fs::exists(out) && !fs::is_empty(out))throw std::runtime_error("Output folder must be new or empty: "+outputDir);
     fs::create_directories(out);
     const auto& c=b.base;const size_t n=b.runs.size();
@@ -485,7 +498,7 @@ inline std::pair<double,double> interval(const Moments& m,bool probability){
 inline void number(std::ostream& out,double x){if(std::isfinite(x))out<<std::setprecision(12)<<x;}
 inline std::ofstream open(const std::filesystem::path& path){
     std::ofstream out(path,std::ios::binary);
-    if(!out)throw std::runtime_error("Cannot write study file: "+path.u8string());
+    if(!out)throw std::runtime_error("Cannot write study file: "+pathToUtf8(path));
     out.exceptions(std::ios::badbit|std::ios::failbit);
     out.imbue(std::locale::classic());
     out<<std::setprecision(12);return out;
@@ -644,7 +657,7 @@ inline int runParameterStudy(const Config& input,int count,uint32_t seed,const s
         throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase sample interval");
     if(count*std::ceil(base.maxTime/base.dt)>2e8)
         throw std::invalid_argument("Too many integration steps; reduce runs or simulation duration");
-    const std::filesystem::path root=std::filesystem::u8path(outputDir);
+    const std::filesystem::path root=pathFromUtf8(outputDir);
     if(std::filesystem::exists(root)&&(!std::filesystem::is_directory(root)||!std::filesystem::is_empty(root)))
         throw std::invalid_argument("Study output folder must be new or empty: "+outputDir);
     std::filesystem::create_directories(root);
@@ -689,7 +702,7 @@ inline std::string newResultPath(const std::string& kind){
 #endif
     char buffer[64];std::strftime(buffer,sizeof(buffer),"%Y%m%d_%H%M%S",&stamp);
     std::string p="results/"+kind+"_"+buffer;int suffix=1;
-    while(std::filesystem::exists(std::filesystem::u8path(p)))p="results/"+kind+"_"+buffer+"_"+std::to_string(suffix++);
+    while(std::filesystem::exists(pathFromUtf8(p)))p="results/"+kind+"_"+buffer+"_"+std::to_string(suffix++);
     return p;
 }
 inline void cliHelp(){
@@ -776,7 +789,7 @@ inline int runCommandLine(int argc,char** argv){
             throw std::invalid_argument("Terrain studies start at v1.4");
 #endif
         if(!terrainFile.empty()){
-            std::ifstream f(std::filesystem::u8path(terrainFile));if(!f)throw std::invalid_argument("Cannot read terrain CSV");
+            std::ifstream f(pathFromUtf8(terrainFile));if(!f)throw std::invalid_argument("Cannot read terrain CSV");
             c.terrain.points.clear();std::string line;bool first=true;
             while(std::getline(f,line)){
                 if(line.empty())continue;
@@ -798,11 +811,11 @@ inline int runCommandLine(int argc,char** argv){
 #if ROCK_STAGE >= 4
         if(mode=="terrain"){if(output.empty())output=newResultPath("terrain");runTerrainStudy(c,count,seed,output);std::cout<<"Saved: "<<output<<'\n';return 0;}
 #endif
-        if(!output.empty() && std::filesystem::exists(std::filesystem::u8path(output)) && !std::filesystem::is_empty(std::filesystem::u8path(output)))throw std::invalid_argument("Output folder must be new or empty: "+output);
+        if(!output.empty() && std::filesystem::exists(pathFromUtf8(output)) && !std::filesystem::is_empty(pathFromUtf8(output)))throw std::invalid_argument("Output folder must be new or empty: "+output);
         auto b=runBatch(c,count,seed);std::cout<<batchSummary(b);
 #if ROCK_STAGE >= 2
         if(output.empty())output=newResultPath("batch");exportBatch(b,output);
-        std::cout<<"Saved: "<<std::filesystem::absolute(std::filesystem::u8path(output)).u8string()<<'\n';
+        std::cout<<"Saved: "<<pathToUtf8(std::filesystem::absolute(pathFromUtf8(output)))<<'\n';
 #else
         if(!output.empty())throw std::invalid_argument("CSV export starts at v1.2");
 #endif
