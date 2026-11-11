@@ -4,11 +4,11 @@
 // 外部依赖：Windows、Visual Studio C++17、EasyX（本机已经安装）。
 // Visual Studio：新建“空项目/控制台应用”，将本文件作为唯一有入口的.cpp加入，
 // 选择 x64，支持 ISO C++17 / C++20；源文件使用 UTF-8 编码。
-// 默认运行显示中文菜单；命令行示例：
+// 默认运行直接打开统计画布；命令行示例：
 //   rollingstone.exe --batch --runs 500 --seed 42
 //   rollingstone.exe --study --runs 200 --seed 42 --cv 0.1
 // 输出位于运行目录的 results 子目录，不覆盖已有数据。
-// 说明：原有动画保留作为演示；作业统计和研究使用新批量核心。
+// 画布、轨迹回放、概率统计、CSV及参数分析使用同一批量计算核心。
 // 教学二维近似模型；不是经现场标定的工程防护设计工具。
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,7 +29,7 @@
 // ==================== cli.hpp ====================
 // ==================== version.hpp ====================
 #define ROCK_STAGE 3
-#define ROCK_VERSION "v1.3.2"
+#define ROCK_VERSION "v1.3.3"
 
 // ==================== simulation.hpp ====================
 // ==================== model.hpp ====================
@@ -707,7 +707,7 @@ inline std::string newResultPath(const std::string& kind){
 }
 inline void cliHelp(){
     std::cout<<"Rollingstone "<<ROCK_VERSION<<" | SI units | local educational simulator\n"
-      <<"No arguments: Chinese menu (tasks 1-3).\n"
+      <<"No arguments: interactive canvas (tasks 1-3).\n"
       <<"--batch --runs 200 --seed 42 [--out results/name]\n"
       <<"--study : paired parameter experiments (5 parameters x 3 mean levels)\n"
       <<"--speed 1.5 --radius 2 --cv .1 --dt .002 --max-time 60 --sample-interval .02\n"
@@ -824,972 +824,481 @@ inline int runCommandLine(int argc,char** argv){
 }
 }
 
-using std::min; using std::max;
-#include <easyx.h>
-// Compatibility for the original drawing code; no private graphics.h is required.
-static void legacySetColor(COLORREF color) { setlinecolor(color); settextcolor(color); }
-static void legacyFillPolygon(int count,const int* xy) {
-    std::vector<POINT> points(static_cast<size_t>(count));
-    for(int i=0;i<count;++i) { points[i].x=xy[2*i]; points[i].y=xy[2*i+1]; }
-    fillpolygon(points.data(),count);
-}
-#include <conio.h>
-#include <math.h>
-#include <cstring>
-#include <cmath>
-#include <tchar.h>
-#include <windows.h>
-#include <cstdlib>
-#include <cstdio>
 
-// ============================================================================
-//  山区滚石模拟（米制版）
-//  ---------------------------------------------------------------
-//  物理量全部用国际单位制：位置 m、速度 m/s、时间 s、质量 kg、能量 J
-//  只有在“画图”这一步才换算成像素，换算比例 PX_PER_M
-//  物理模型：
-//    · 触地滚动：a = (5/7) g sinθ − c_rr g cosθ − 空气阻力      （实心球纯滚动）
-//    · 陡坡打滑：tanθ > μ 时摩擦不足以维持纯滚动，改用 a = g(sinθ − μcosθ)
-//    · 空中飞行：竖直重力 + 二次空气阻力 ½ρCdAv²
-//    · 碰撞弹跳：法向恢复系数 e，切向按库仑冲量损失
-//    · 停止：速度足够小且坡度小于摩擦角（不规则块体被地面抓住）
-// ============================================================================
+// ==================== interactive viewer ====================
 
-// ------------------------------------------------------------------ 画面
-#define WIDTH 1000          // 窗口宽度（像素）
-#define HEIGHT 600          // 窗口高度（像素）
-#define PX_PER_M 8.0        // 显示比例：1 米 = 8 像素（窗口即 125 m × 75 m）
-#define ORIGIN_Y 490.0      // 高程 z=0 对应的屏幕 y 坐标
-#define GROUND_Y 490        // 坡脚基准线（屏幕 y）
-
-// ------------------------------------------------------------------ 物理常数
-#define GRAVITY 9.81        // 重力加速度 (m/s²)
-#define DT 0.002            // 物理步长 (s)
-#define STEPS_PER_FRAME 8   // 每帧 8 步 × 2 ms = 16 ms ≈ 实时
-#define ROCK_DENSITY 2600.0 // 岩石密度 (kg/m³)
-#define AIR_DENSITY 1.225   // 空气密度 (kg/m³)
-#define MIN_RADIUS 0.2      // 半径可调下限 (m)，只用来防止误操作，不是默认半径
-#define MAX_RADIUS 3.0      // 半径可调上限 (m)
-#define BOUNCE_MIN 0.15     // 法向速度小于此值不再弹跳，按接触处理 (m/s)
-#define REST_SPEED 0.05     // 判定“停住”的速度阈值 (m/s)
-
-// 可调参数（程序运行时通过菜单修改）
-double g_rollResist = 0.02;      // 滚动阻力系数 c_rr（0.02~0.20）
-double g_slideFriction = 0.45;   // 地面摩擦系数 μ（tan 24°，坡面摩擦角约 24°）
-double g_restitution = 0.45;     // 法向恢复系数 e
-double g_dragCoef = 1.0;         // 空气阻力系数 Cd（0 表示真空）
-int g_playbackFactor = 1;        // 1x,2x,4x,8x
-
-// ------------------------------------------------------------------ 坐标换算
-double toPxX(double x) { return x * PX_PER_M; }
-double toPxY(double z) { return ORIGIN_Y - z * PX_PER_M; }
-
-// 地形点（x 水平距离 m，z 高程 m，向上为正）
-struct Point {
-    double x, z;
-    Point(double x = 0, double z = 0) : x(x), z(z) {}
-};
-
-// 时间-速度数据结构（替代 std::pair<double,double>）
-struct TimeSpeed {
-    double t;
-    double s;
-    TimeSpeed(double tt = 0.0, double ss = 0.0) : t(tt), s(ss) {}
-};
-
-// 简单动态数组模板（替代 std::vector）
-template<typename T>
-class DynamicArray {
-private:
-    T* data;
-    size_t cnt;
-    size_t cap;
-
-    void grow() {
-        size_t newCap = cap == 0 ? 4 : cap * 2;
-        T* newData = new T[newCap];
-        if (data) {
-            for (size_t i = 0; i < cnt; ++i) newData[i] = data[i];
-            delete[] data;
-        }
-        data = newData;
-        cap = newCap;
-    }
-
-public:
-    DynamicArray() : data(nullptr), cnt(0), cap(0) {}
-    ~DynamicArray() { delete[] data; }
-    DynamicArray(const DynamicArray& other) : data(nullptr), cnt(0), cap(0) {
-        if (other.cnt > 0) {
-            data = new T[other.cnt];
-            for (size_t i = 0; i < other.cnt; ++i) data[i] = other.data[i];
-            cnt = other.cnt; cap = other.cnt;
-        }
-    }
-    DynamicArray& operator=(const DynamicArray& other) {
-        if (this == &other) return *this;
-        delete[] data;
-        data = nullptr; cnt = 0; cap = 0;
-        if (other.cnt > 0) {
-            data = new T[other.cnt];
-            for (size_t i = 0; i < other.cnt; ++i) data[i] = other.data[i];
-            cnt = other.cnt; cap = other.cnt;
-        }
-        return *this;
-    }
-
-    void push_back(const T& v) {
-        if (cnt >= cap) grow();
-        data[cnt++] = v;
-    }
-
-    void erase_front() {
-        if (cnt == 0) return;
-        for (size_t i = 1; i < cnt; ++i) data[i - 1] = data[i];
-        --cnt;
-    }
-
-    size_t size() const { return cnt; }
-    bool empty() const { return cnt == 0; }
-    T& operator[](size_t i) { return data[i]; }
-    const T& operator[](size_t i) const { return data[i]; }
-    void clear() { cnt = 0; }
-};
-
-// ------------------------------------------------------------------ 山坡地形
-// 13 个控制点，x 从 0 到 120 m，高程从 55.6 m 降到 0 m（坡脚）
-class HillSlope {
-private:
-    DynamicArray<Point> points;  // 地形控制点（米）
-    int startX, endX;            // 只用于快速判断，单位仍是米（取整）
-
-public:
-    HillSlope() {
-        // 一条长 120 m、落差 55.6 m 的山区坡面：上部陡、中部有缓台、坡脚有一段平台
-        points.push_back(Point(0.0, 55.6));    // 坡顶（危岩位置）
-        points.push_back(Point(10.0, 51.9));
-        points.push_back(Point(11.25, 50.6));
-        points.push_back(Point(30.0, 35.6));   // 陡坡段
-        points.push_back(Point(40.0, 34.4));   // 缓台（约 7°）
-        points.push_back(Point(50.0, 23.1));   // 陡坡段
-        points.push_back(Point(60.0, 20.6));
-        points.push_back(Point(70.0, 15.6));
-        points.push_back(Point(80.0, 10.0));
-        points.push_back(Point(90.0, 8.75));   // 缓台
-        points.push_back(Point(100.0, 2.88));
-        points.push_back(Point(120.0, 0.0));   // 坡脚平台（道路位置）
-
-        startX = (int)points[0].x;
-        endX = (int)points[points.size() - 1].x;
-    }
-
-    // 指定 x 处的地面高程 z (m)
-    double getHeight(double x) const {
-        if (x <= points[0].x) return points[0].z;
-        if (x >= points[points.size() - 1].x) return points[points.size() - 1].z;
-
-        for (size_t i = 0; i < points.size() - 1; i++) {
-            if (x >= points[i].x && x <= points[i + 1].x) {
-                double t = (x - points[i].x) / (points[i + 1].x - points[i].x);
-                return points[i].z + t * (points[i + 1].z - points[i].z);
-            }
-        }
-        return points[0].z;
-    }
-
-    // 指定 x 处的坡角 θ（弧度，>0 表示顺坡向下）
-    double getSlopeAngle(double x) const {
-        if (x <= points[0].x) {
-            double dz = points[1].z - points[0].z;
-            double dx = points[1].x - points[0].x;
-            return -atan2(dz, dx);
-        }
-        if (x >= points[points.size() - 1].x) {
-            double dz = points[points.size() - 1].z - points[points.size() - 2].z;
-            double dx = points[points.size() - 1].x - points[points.size() - 2].x;
-            return -atan2(dz, dx);
-        }
-
-        for (size_t i = 0; i < points.size() - 1; i++) {
-            if (x >= points[i].x && x <= points[i + 1].x) {
-                double dz = points[i + 1].z - points[i].z;
-                double dx = points[i + 1].x - points[i].x;
-                return -atan2(dz, dx);
-            }
-        }
-        return 0;
-    }
-
-    // 绘制山坡（唯一需要把米换成像素的地方）
-    void draw() const {
-        for (size_t i = 0; i < points.size() - 1; i++) {
-            int x1 = (int)toPxX(points[i].x);
-            int y1 = (int)toPxY(points[i].z);
-            int x2 = (int)toPxX(points[i + 1].x);
-            int y2 = (int)toPxY(points[i + 1].z);
-
-            legacySetColor(RGB(34, 139, 34));
-            setlinestyle(PS_SOLID, 3);
-            line(x1, y1, x2, y2);
-
-            setfillcolor(RGB(139, 90, 43));
-            int pts[8] = { x1, y1, x2, y2, x2, HEIGHT, x1, HEIGHT };
-            legacyFillPolygon(4, pts);
-        }
-
-        // 坡脚基准线（z = 0）
-        legacySetColor(RGB(160, 82, 45));
-        setlinestyle(PS_SOLID, 1);
-        line(0, (int)toPxY(0), WIDTH, (int)toPxY(0));
-    }
-
-    int getStartX() const { return startX; }
-    int getEndX() const { return endX; }
-
-    int getPeakX() const {
-        if (points.empty()) return startX;
-        double bestZ = points[0].z;
-        int bestX = (int)points[0].x;
-        for (size_t i = 1; i < points.size(); ++i) {
-            if (points[i].z > bestZ) {   // 高程最大者即坡顶
-                bestZ = points[i].z;
-                bestX = (int)points[i].x;
-            }
-        }
-        return bestX;
-    }
-
-    int getValleyX() const {
-        if (points.empty()) return startX;
-        double lowZ = points[0].z;
-        int lowX = (int)points[0].x;
-        for (size_t i = 1; i < points.size(); ++i) {
-            if (points[i].z < lowZ) {    // 高程最小者即坡脚
-                lowZ = points[i].z;
-                lowX = (int)points[i].x;
-            }
-        }
-        return lowX;
-    }
-};
-
-// ------------------------------------------------------------------ 滚石
-class RollingStone {
-private:
-    double x, z;        // 球心位置（m）
-    double vx, vz;      // 速度（m/s）
-    double radius;      // 半径（m）
-    bool isRolling;     // 是否还在运动
-    double energy;      // 动能（J）
-    double omega;       // 角速度（rad/s），纯滚动时 ω = v/r
-    double mass;        // 质量（kg），由半径和密度算出
-    DynamicArray<Point> trail;
-    int trailMax;
-
-    void updateMass() {
-        double vol = 4.0 / 3.0 * 3.14159265358979 * radius * radius * radius;
-        mass = ROCK_DENSITY * vol;
-    }
-
-public:
-    // 半径没有默认值：必须由调用者（main）给定，对象只负责保存和使用
-    RollingStone(double startX, double startZ, double r, double initVx)
-        : x(startX), z(startZ), vx(initVx), vz(0), radius(r), isRolling(true),
-          energy(0), omega(0), mass(0), trailMax(40) {
-        if (radius < MIN_RADIUS) radius = MIN_RADIUS;
-        if (radius > MAX_RADIUS) radius = MAX_RADIUS;
-        updateMass();
-        // 让球心正好贴在坡面上：沿法向抬高一个半径（真正的坡角在 adjustToGround 里再修正）
-        z = startZ + radius;
-    }
-
-    // 大气阻力系数：a_drag = kd·v²，kd = ½ρCdA/m
-    double dragK() const {
-        double A = 3.14159265358979 * radius * radius;
-        return 0.5 * AIR_DENSITY * g_dragCoef * A / mass;
-    }
-
-    // 物理更新：一步 dt
-    void update(const HillSlope& hill, double dt) {
-        if (!isRolling) return;
-
-        double zg = hill.getHeight(x);
-        double th = hill.getSlopeAngle(x);        // 坡角，>0 顺坡向下
-        double ct = cos(th), st = sin(th);
-        double nx = st, nz = ct;                  // 坡面外法向
-        double dx = ct, dz = -st;                 // 顺坡切向（下坡方向）
-
-        // 球心到坡面的法向距离：竖直高差投影到法向
-        double dist = (z - zg) * ct;
-        double vt = vx * dx + vz * dz;            // 切向速度（下坡为正）
-        double vn = vx * nx + vz * nz;            // 法向速度（离开坡面为正）
-
-        if (dist <= radius + 1e-3) {
-            // ---------------- 接触坡面 ----------------
-            z = zg + radius / ct;                 // 沿法向推回，恰好在表面
-
-            if (vn < -BOUNCE_MIN) {
-                // 弹跳：法向按恢复系数反弹，切向按库仑冲量损失
-                double vnOut = -g_restitution * vn;
-                double dvt = g_slideFriction * (1.0 + g_restitution) * fabs(vn);
-                double sgn = (vt >= 0) ? 1.0 : -1.0;
-                double vtOut = fabs(vt) - dvt;
-                if (vtOut < 0) vtOut = 0;
-                vt = sgn * vtOut;
-                vn = vnOut;
-                omega = vt / radius;
-            }
-            else {
-                // 贴地运动：纯滚动 or 打滑
-                vn = 0;
-                double a;
-                if (tan(th) > g_slideFriction) {
-                    // 摩擦不足以维持纯滚动 → 打滑，转动不再同步
-                    a = GRAVITY * (st - g_slideFriction * ct);
-                    omega = 0;
-                }
-                else {
-                    // 实心球纯滚动：转动惯量 I = 2/5 mR²，只有 5/7 的重力分量用于平动
-                    a = (5.0 / 7.0) * GRAVITY * st - g_rollResist * GRAVITY * ct;
-                    omega = vt / radius;
-                }
-                vt += a * dt;
-                // 空气阻力（沿切向，与速度反向）
-                double kd = dragK();
-                vt -= kd * fabs(vt) * vt * dt;
-
-                // 速度很小且坡度小于摩擦角 → 被地面抓住，停住
-                if (fabs(vt) < REST_SPEED && tan(th) <= g_slideFriction) {
-                    vt = 0;
-                    isRolling = false;
-                }
-                else if (vt < 0) {
-                    vt = 0;
-                }
-            }
-            vx = vt * dx + vn * nx;
-            vz = vt * dz + vn * nz;
-        }
-        else {
-            // ---------------- 空中飞行 ----------------
-            vz -= GRAVITY * dt;
-            double sp = sqrt(vx * vx + vz * vz);
-            double kd = dragK();
-            if (sp > 1e-9) {
-                vx -= kd * sp * vx * dt;
-                vz -= kd * sp * vz * dt;
-            }
-        }
-
-        // 位置更新
-        x += vx * dt;
-        z += vz * dt;
-
-        // 边界：坡顶以上、坡脚以外
-        if (x < hill.getStartX()) {
-            x = hill.getStartX();
-            vx = 0;
-        }
-        if (x >= hill.getEndX()) {
-            x = hill.getEndX();
-            vx = 0;
-            isRolling = false;
-        }
-
-        // 防止穿过坡面：位置夹回表面，并去掉指向坡内的法向速度
-        zg = hill.getHeight(x);
-        th = hill.getSlopeAngle(x);
-        {
-            double ct2 = cos(th), st2 = sin(th);
-            if ((z - zg) * ct2 < radius) {
-                z = zg + radius / ct2;
-                double vn2 = vx * st2 + vz * ct2;
-                if (vn2 < 0) {
-                    vx -= vn2 * st2;
-                    vz -= vn2 * ct2;
-                }
-            }
-        }
-
-        // 动能：滚动时含转动动能 E = ½mv² + ½Iω² = 0.7mv²；其他情况只有平动
-        double v2 = vx * vx + vz * vz;
-        if (fabs(omega) > 1e-9) energy = 0.5 * mass * v2 + 0.2 * mass * radius * radius * omega * omega;
-        else energy = 0.5 * mass * v2;
-
-        // 记录轨迹（世界坐标，米）
-        trail.push_back(Point(x, z));
-        if ((int)trail.size() > trailMax) trail.erase_front();
-    }
-
-    // 绘制石头与轨迹（米 → 像素在这里完成）
-    void draw() const {
-        // 轨迹
-        for (size_t i = 0; i < trail.size(); i++) {
-            int alpha = 100 - (int)(i * 100 / trail.size());
-            (void)alpha;
-            legacySetColor(RGB(255, 100, 100));
-            setfillstyle(BS_SOLID);
-            int size = 3 - (int)(i * 2 / trail.size());
-            if (size < 1) size = 1;
-            solidcircle((int)toPxX(trail[i].x), (int)toPxY(trail[i].z), size);
-        }
-
-        // 抗锯齿圆掩码（按屏幕半径缓存）
-        struct CircleMask {
-            int r;
-            int sz;
-            unsigned char* alpha;
-            CircleMask() :r(0), sz(0), alpha(nullptr) {}
-            ~CircleMask() { delete[] alpha; }
-            void generate(int radiusPx, int ss = 4) {
-                if (radiusPx <= 0) return;
-                if (r == radiusPx && alpha) return;
-                delete[] alpha; alpha = nullptr;
-                r = radiusPx;
-                sz = 2 * r + 1;
-                alpha = new unsigned char[sz * sz];
-                int samples = ss * ss;
-                double rr = (double)r;
-                for (int iy = -r; iy <= r; ++iy) {
-                    for (int ix = -r; ix <= r; ++ix) {
-                        int inside = 0;
-                        for (int sy = 0; sy < ss; ++sy) {
-                            for (int sx = 0; sx < ss; ++sx) {
-                                double fx = ix + (sx + 0.5) / ss;
-                                double fy = iy + (sy + 0.5) / ss;
-                                if (fx * fx + fy * fy <= rr * rr) inside++;
-                            }
-                        }
-                        unsigned char a = (unsigned char)((inside * 255) / samples);
-                        alpha[(iy + r) * sz + (ix + r)] = a;
-                    }
-                }
-            }
-        };
-
-        int ir = (int)(radius * PX_PER_M);
-        if (ir < 4) ir = 4;              // 显示时给一个最小半径，否则 1 m 的石头只有 8 px
-
-        static CircleMask mask;
-        mask.generate(ir, 3);
-
-        COLORREF stoneColor = RGB(120, 120, 120);
-        int mr = mask.r; int msz = mask.sz;
-
-        // 阴影
-        for (int yi = 0; yi < msz; ++yi) {
-            for (int xi = 0; xi < msz; ++xi) {
-                unsigned char a = mask.alpha[yi * msz + xi];
-                if (a == 0) continue;
-                int px = (int)toPxX(x) - mr + xi + 2;
-                int py = (int)toPxY(z) - mr + yi + 3;
-                if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT) continue;
-                COLORREF bg = getpixel(px, py);
-                COLORREF sc = RGB(60, 60, 60);
-                int alpha = a;
-                int inv = 255 - alpha;
-                int br = (GetRValue(sc) * alpha + GetRValue(bg) * inv) / 255;
-                int bgc = (GetGValue(sc) * alpha + GetGValue(bg) * inv) / 255;
-                int bb = (GetBValue(sc) * alpha + GetBValue(bg) * inv) / 255;
-                putpixel(px, py, RGB(br, bgc, bb));
-            }
-        }
-
-        // 主体
-        for (int yi = 0; yi < msz; ++yi) {
-            for (int xi = 0; xi < msz; ++xi) {
-                unsigned char a = mask.alpha[yi * msz + xi];
-                if (a == 0) continue;
-                int px = (int)toPxX(x) - mr + xi;
-                int py = (int)toPxY(z) - mr + yi;
-                if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT) continue;
-                COLORREF bg = getpixel(px, py);
-                int alpha = a;
-                int inv = 255 - alpha;
-                int rr = (GetRValue(stoneColor) * alpha + GetRValue(bg) * inv) / 255;
-                int gg = (GetGValue(stoneColor) * alpha + GetGValue(bg) * inv) / 255;
-                int bb = (GetBValue(stoneColor) * alpha + GetBValue(bg) * inv) / 255;
-                putpixel(px, py, RGB(rr, gg, bb));
-            }
-        }
-
-        // 高光
-        int hr = max(1, (int)(ir / 3));
-        static CircleMask hmask;
-        hmask.generate(hr, 3);
-        COLORREF highlight = RGB(180, 180, 180);
-        int hmr = hmask.r; int hmsz = hmask.sz;
-        int hx = (int)(toPxX(x) - ir / 3);
-        int hy = (int)(toPxY(z) - ir / 3);
-        for (int yi = 0; yi < hmsz; ++yi) {
-            for (int xi = 0; xi < hmsz; ++xi) {
-                unsigned char a = hmask.alpha[yi * hmsz + xi];
-                if (a == 0) continue;
-                int px = hx - hmr + xi;
-                int py = hy - hmr + yi;
-                if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT) continue;
-                COLORREF bg = getpixel(px, py);
-                int alpha = a;
-                int inv = 255 - alpha;
-                int rr = (GetRValue(highlight) * alpha + GetRValue(bg) * inv) / 255;
-                int gg = (GetGValue(highlight) * alpha + GetGValue(bg) * inv) / 255;
-                int bb = (GetBValue(highlight) * alpha + GetBValue(bg) * inv) / 255;
-                putpixel(px, py, RGB(rr, gg, bb));
-            }
-        }
-    }
-
-    bool isMoving() const { return isRolling; }
-    double getX() const { return x; }
-    double getZ() const { return z; }
-    double getSpeed() const { return sqrt(vx * vx + vz * vz); }
-    double getEnergy() const { return energy; }
-    double getRadius() const { return radius; }
-    double getMass() const { return mass; }
-    void setRadius(double r) {
-        if (r < MIN_RADIUS) r = MIN_RADIUS;
-        if (r > MAX_RADIUS) r = MAX_RADIUS;
-        radius = r;
-        updateMass();
-    }
-    void adjustToGround(const HillSlope& hill) {
-        double zg = hill.getHeight(x);
-        z = zg + radius / cos(hill.getSlopeAngle(x));
-        vz = 0;
-    }
-    // 顺坡释放：初速度沿坡面切向，而不是水平（更接近“石块从坡面脱离”）
-    void startAlongSlope(const HillSlope& hill, double v0) {
-        double th = hill.getSlopeAngle(x);
-        vx = v0 * cos(th);
-        vz = -v0 * sin(th);
-        omega = v0 / radius;
-    }
-};
-
-// ------------------------------------------------------------------ 主程序
-int originalViewer() {
-    initgraph(WIDTH, HEIGHT);
-    setbkcolor(RGB(135, 206, 235));
-    BeginBatchDraw();
-
-    HillSlope hill;
-    int initX = hill.getPeakX();
-    double initZ = hill.getHeight((double)initX);
-
-    // ---- 滚石参数：在 main 里给定，构造时交给滚石对象（对象内部只保存、不再有默认值）----
-    double stoneRadius = 2.0;   // 滚石半径 (m)
-    double stoneSpeed = 1.5;    // 顺坡释放的初速度 (m/s)
-
-    RollingStone stone((double)initX, initZ, stoneRadius, 0.0);
-    stone.adjustToGround(hill);
-    stone.startAlongSlope(hill, stoneSpeed);
-    int valleyX = hill.getValleyX();
-    bool simEnded = false;
-
-    bool paused = false;
-    double stoppedDuration = 0.0;
-    bool stoppedTriggered = false;
-    bool inMenu = false;
-    int menuSel = 0;                       // 0: c_rr 1: μ 2: e 3: Cd 4: 倍速
-    const int menuRows = 4;
-    const int playbackOptions[4] = { 1, 2, 4, 8 };
-    int playbackIndex = 0;
-    bool inPauseMenu = false;
-    int pauseMenuSel = 0;
-
-    char inputBuf[4][32];
-    sprintf_s(inputBuf[0], sizeof(inputBuf[0]), "%.3f", g_rollResist);
-    sprintf_s(inputBuf[1], sizeof(inputBuf[1]), "%.3f", g_slideFriction);
-    sprintf_s(inputBuf[2], sizeof(inputBuf[2]), "%.3f", g_restitution);
-    sprintf_s(inputBuf[3], sizeof(inputBuf[3]), "%.3f", g_dragCoef);
-
-    DynamicArray< TimeSpeed > speedData;
-    double simTime = 0.0;
-    const double graphWindow = 10.0;
-
-    settextstyle(16, 0, _T("Consolas"));
-    legacySetColor(RGB(50, 50, 50));
-    outtextxy(10, 20, _T("Rolling Stone Simulator - SI Units (m, s, kg, J)"));
-    outtextxy(10, 45, _T("Controls: SPACE=Pause, M=Parameters, P=Pause menu, R=Reset, ESC=Exit"));
-
-    while (true) {
-        if (_kbhit()) {
-            int key = _getch();
-            if (key == 27) break;
-            if (key == 32) {
-                paused = !paused;
-            }
-            if (key == 'p' || key == 'P') {
-                inPauseMenu = !inPauseMenu;
-                pauseMenuSel = paused ? 1 : 0;
-            }
-            if (inPauseMenu) {
-                if (key == 'w' || key == 'W' || key == 's' || key == 'S') {
-                    pauseMenuSel = 1 - pauseMenuSel;
-                }
-                if (key == 13) {
-                    if (pauseMenuSel == 0) paused = true; else paused = false;
-                    inPauseMenu = false;
-                }
-            }
-            if (key == 'r' || key == 'R') {
-                double keepRadius = stone.getRadius();   // 保留用户用 +/- 改过的半径
-                stone = RollingStone((double)initX, initZ, keepRadius, 0.0);
-                stone.adjustToGround(hill);
-                stone.startAlongSlope(hill, stoneSpeed);
-                paused = false;
-                simEnded = false;
-                stoppedDuration = 0.0;
-                stoppedTriggered = false;
-                speedData.clear();
-                simTime = 0.0;
-                cleardevice();
-            }
-            if (key == '+' || key == '=') {
-                stone.setRadius(stone.getRadius() + 0.1);
-                stone.adjustToGround(hill);
-            }
-            if (key == '-' || key == '_') {
-                stone.setRadius(stone.getRadius() - 0.1);
-                stone.adjustToGround(hill);
-            }
-            if (key == 'm' || key == 'M') {
-                inMenu = !inMenu;
-                playbackIndex = 0;
-                for (int i = 0; i < 4; i++) if (playbackOptions[i] == g_playbackFactor) playbackIndex = i;
-            }
-            if (inMenu) {
-                if (key == 'w' || key == 'W') { menuSel = (menuSel + menuRows) % (menuRows + 1); }
-                if (key == 's' || key == 'S') { menuSel = (menuSel + 1) % (menuRows + 1); }
-                if (key == 'a' || key == 'A') {
-                    if (menuSel == 0) g_rollResist = max(0.0, g_rollResist - 0.01);
-                    if (menuSel == 1) g_slideFriction = max(0.0, g_slideFriction - 0.05);
-                    if (menuSel == 2) g_restitution = max(0.0, g_restitution - 0.05);
-                    if (menuSel == 3) g_dragCoef = max(0.0, g_dragCoef - 0.1);
-                    if (menuSel == 4) { playbackIndex = max(0, playbackIndex - 1); g_playbackFactor = playbackOptions[playbackIndex]; }
-                }
-                if (key == 'd' || key == 'D') {
-                    if (menuSel == 0) g_rollResist = min(0.30, g_rollResist + 0.01);
-                    if (menuSel == 1) g_slideFriction = min(1.00, g_slideFriction + 0.05);
-                    if (menuSel == 2) g_restitution = min(0.90, g_restitution + 0.05);
-                    if (menuSel == 3) g_dragCoef = min(2.00, g_dragCoef + 0.1);
-                    if (menuSel == 4) { playbackIndex = min(3, playbackIndex + 1); g_playbackFactor = playbackOptions[playbackIndex]; }
-                }
-                if (key == 13) { inMenu = false; }
-            }
-        }
-
-        if (!paused) {
-            // 每帧 8 个子步（2 ms × 8 = 16 ms），倍速就是“每帧多跑几步”
-            int steps = STEPS_PER_FRAME * g_playbackFactor;
-            for (int i = 0; i < steps; ++i) {
-                stone.update(hill, DT);
-                simTime += DT;
-            }
-            double curSpeed = stone.getSpeed();
-            speedData.push_back(TimeSpeed(simTime, curSpeed));
-            while (!speedData.empty() && speedData[0].t < simTime - graphWindow) {
-                speedData.erase_front();
-            }
-
-            if (!simEnded) {
-                if (stone.getX() >= hill.getEndX() - 0.5) {
-                    MessageBox(NULL, _T("滚石到达坡脚，模拟结束"), _T("提示"), MB_OK | MB_ICONINFORMATION);
-                    EndBatchDraw();
-                    closegraph();
-                    return 0;
-                }
-            }
-
-            if (!stoppedTriggered && !simEnded) {
-                if (curSpeed < REST_SPEED) stoppedDuration += STEPS_PER_FRAME * DT * g_playbackFactor;
-                else stoppedDuration = 0.0;
-                if (stoppedDuration >= 3.0) {
-                    MessageBox(NULL, _T("滚石停止运动，模拟结束"), _T("提示"), MB_OK | MB_ICONINFORMATION);
-                    EndBatchDraw();
-                    closegraph();
-                    return 0;
-                }
-            }
-
-            cleardevice();
-            setbkcolor(RGB(135, 206, 235));
-
-            if (inMenu) {
-                setfillcolor(RGB(240, 240, 240));
-                solidrectangle(70, 45, 500, 440);
-                legacySetColor(RGB(0, 0, 0));
-                settextstyle(16, 0, _T("Consolas"));
-                outtextxy(90, 55, _T("Parameters (W/S select, A/D change, Enter apply)"));
-
-                TCHAR bufMenu[160];
-                for (int i = 0; i < menuRows; i++) {
-                    int y = 100 + i * 55;
-                    if (i == menuSel) legacySetColor(RGB(255, 0, 0)); else legacySetColor(RGB(0, 0, 0));
-                    if (i == 0) _stprintf_s(bufMenu, 160, _T("滚动阻力 c_rr (0.02-0.20):"));
-                    else if (i == 1) _stprintf_s(bufMenu, 160, _T("摩擦系数 mu (0.3-0.8):"));
-                    else if (i == 2) _stprintf_s(bufMenu, 160, _T("恢复系数 e (0.2-0.6):"));
-                    else _stprintf_s(bufMenu, 160, _T("空气阻力 Cd (0=真空):"));
-                    outtextxy(90, y, bufMenu);
-
-                    legacySetColor(RGB(0, 0, 0));
-                    TCHAR tbuf[64];
-                    size_t outLen = 0;
-                    mbstowcs_s(&outLen, tbuf, sizeof(tbuf) / sizeof(TCHAR), inputBuf[i], sizeof(inputBuf[i]));
-                    outtextxy(400, y, tbuf);
-                }
-                int y = 100 + menuRows * 55;
-                if (menuSel == menuRows) legacySetColor(RGB(255, 0, 0)); else legacySetColor(RGB(0, 0, 0));
-                _stprintf_s(bufMenu, 160, _T("播放倍速: x1 x2 x4 x8 (当前 x%d)"), g_playbackFactor);
-                outtextxy(90, y, bufMenu);
-
-                setfillcolor(RGB(100, 200, 100));
-                solidrectangle(250, 380, 380, 415);
-                legacySetColor(RGB(0, 0, 0));
-                outtextxy(275, 388, _T("启动模拟"));
-
-                if (GetAsyncKeyState(VK_RETURN) & 0x8000) {
-                    double v0 = atof(inputBuf[0]);
-                    double v1 = atof(inputBuf[1]);
-                    double v2 = atof(inputBuf[2]);
-                    double v3 = atof(inputBuf[3]);
-                    if (v0 < 0.0) v0 = 0.0; if (v0 > 0.30) v0 = 0.30;
-                    if (v1 < 0.0) v1 = 0.0; if (v1 > 1.00) v1 = 1.00;
-                    if (v2 < 0.0) v2 = 0.0; if (v2 > 0.90) v2 = 0.90;
-                    if (v3 < 0.0) v3 = 0.0; if (v3 > 2.00) v3 = 2.00;
-                    g_rollResist = v0; g_slideFriction = v1;
-                    g_restitution = v2; g_dragCoef = v3;
-                    inMenu = false; paused = false; simEnded = false;
-                    stoppedDuration = 0.0; stoppedTriggered = false;
-                    cleardevice();
-                }
-                if (menuSel >= 0 && menuSel <= 3) {
-                    for (int c = 0; c < 256; c++) {
-                        if (GetAsyncKeyState(c) & 0x8000) {
-                            if (c == VK_BACK) {
-                                size_t len = strlen(inputBuf[menuSel]);
-                                if (len > 0) inputBuf[menuSel][len - 1] = 0;
-                            }
-                            else if ((c >= '0' && c <= '9') || c == '.' || c == '-') {
-                                size_t len = strlen(inputBuf[menuSel]);
-                                if (len + 1 < sizeof(inputBuf[menuSel])) {
-                                    inputBuf[menuSel][len] = (char)c;
-                                    inputBuf[menuSel][len + 1] = 0;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                legacySetColor(RGB(80, 80, 80));
-                outtextxy(90, 360, _T("按 R 重置模拟，按 M 退出菜单"));
-            }
-
-            if (inPauseMenu) {
-                setfillcolor(RGB(240, 240, 240));
-                solidrectangle(WIDTH / 2 - 120, HEIGHT / 2 - 40, WIDTH / 2 + 120, HEIGHT / 2 + 40);
-                legacySetColor(RGB(0, 0, 0));
-                settextstyle(16, 0, _T("Consolas"));
-                outtextxy(WIDTH / 2 - 60, HEIGHT / 2 - 24, _T("Pause Menu (W/S select, Enter)"));
-                if (pauseMenuSel == 0) legacySetColor(RGB(255, 0, 0)); else legacySetColor(RGB(0, 0, 0));
-                outtextxy(WIDTH / 2 - 40, HEIGHT / 2 - 2, _T("Pause"));
-                if (pauseMenuSel == 1) legacySetColor(RGB(255, 0, 0)); else legacySetColor(RGB(0, 0, 0));
-                outtextxy(WIDTH / 2 - 40, HEIGHT / 2 + 18, _T("Continue"));
-            }
-
-            hill.draw();
-            stone.draw();
-
-            // -------- HUD（米制） --------
-            TCHAR info[200];
-            legacySetColor(RGB(255, 255, 255));
-            settextstyle(14, 0, _T("Consolas"));
-
-            _stprintf_s(info, 200, _T("Position: %.1f m"), stone.getX());
-            outtextxy(10, HEIGHT - 100, info);
-
-            _stprintf_s(info, 200, _T("Height: %.1f m"), stone.getZ());
-            outtextxy(10, HEIGHT - 80, info);
-
-            _stprintf_s(info, 200, _T("Speed: %.1f m/s"), stone.getSpeed());
-            outtextxy(10, HEIGHT - 60, info);
-
-            _stprintf_s(info, 200, _T("Energy: %.1f kJ"), stone.getEnergy() / 1000.0);
-            outtextxy(10, HEIGHT - 40, info);
-
-            _stprintf_s(info, 200, _T("Diameter: %.2f m   Mass: %.0f kg"), stone.getRadius() * 2.0, stone.getMass());
-            outtextxy(10, HEIGHT - 20, info);
-
-            _stprintf_s(info, 200, _T("Status: %s"), stone.isMoving() ? _T("ROLLING") : _T("STOPPED"));
-            legacySetColor(stone.isMoving() ? RGB(255, 200, 0) : RGB(100, 255, 100));
-            outtextxy(10, HEIGHT - 120, info);
-
-            double slope = hill.getSlopeAngle(stone.getX()) * 180 / 3.14159;
-            legacySetColor(RGB(200, 200, 200));
-            _stprintf_s(info, 200, _T("Slope: %.1f deg"), slope);
-            outtextxy(WIDTH - 130, HEIGHT - 60, info);
-
-            TCHAR paramBuf[240];
-            _stprintf_s(paramBuf, 240, _T("c_rr:%.2f mu:%.2f e:%.2f Cd:%.1f x%d"),
-                        g_rollResist, g_slideFriction, g_restitution, g_dragCoef, g_playbackFactor);
-            legacySetColor(RGB(180, 180, 180));
-            settextstyle(12, 0, _T("Consolas"));
-            outtextxy(WIDTH - 330, 10, paramBuf);
-
-            // 速度条（0~20 m/s）
-            int speedBar = (int)(stone.getSpeed() / 20.0 * 100);
-            if (speedBar > 100) speedBar = 100;
-            setfillcolor(RGB(255, 100, 100));
-            solidrectangle(WIDTH - 120, HEIGHT - 40, WIDTH - 120 + speedBar, HEIGHT - 30);
-            legacySetColor(RGB(150, 150, 150));
-            rectangle(WIDTH - 120, HEIGHT - 40, WIDTH - 20, HEIGHT - 30);
-
-            // -------- 速度-时间曲线 --------
-            const int gx = WIDTH - 260;
-            const int gy = 20;
-            const int gw = 240;
-            const int gh = 120;
-
-            setfillcolor(RGB(135, 206, 235));
-            solidrectangle(gx, gy, gx + gw, gy + gh);
-            legacySetColor(RGB(200, 200, 200));
-            rectangle(gx, gy, gx + gw, gy + gh);
-
-            const int marginL = 36;
-            const int marginR = 8;
-            const int marginTop = 6;
-            const int marginBottom = 20;
-            int plotX = gx + marginL;
-            int plotY = gy + marginTop;
-            int plotW = gw - marginL - marginR;
-            int plotH = gh - marginTop - marginBottom;
-
-            double t0 = simTime - graphWindow;
-            if (t0 < 0) t0 = 0;
-
-            legacySetColor(RGB(180, 180, 180));
-            line(plotX, plotY, plotX, plotY + plotH);
-            line(plotX, plotY + plotH, plotX + plotW, plotY + plotH);
-
-            double gridStart = floor(t0);
-            double gridEnd = ceil(simTime);
-            legacySetColor(RGB(220, 220, 220));
-            setlinestyle(PS_DASH, 1);
-            for (int g = (int)gridStart; g <= (int)gridEnd; ++g) {
-                double gxTime = (double)g;
-                double gxp = plotX + (gxTime - (simTime - graphWindow)) / graphWindow * plotW;
-                if (gxp >= plotX && gxp <= plotX + plotW) {
-                    line((int)gxp, plotY, (int)gxp, plotY + plotH);
-                }
-            }
-            setlinestyle(PS_SOLID, 1);
-
-            double yMax = 8.0;   // 纵轴最小量程 8 m/s
-            for (size_t _i = 0; _i < speedData.size(); ++_i) {
-                auto& p = speedData[_i];
-                if (p.s > yMax) yMax = p.s;
-            }
-            yMax *= 1.1;
-
-            settextstyle(12, 0, _T("Consolas"));
-            legacySetColor(RGB(80, 80, 80));
-            TCHAR buf[64];
-            _stprintf_s(buf, 64, _T("%.1f"), yMax);
-            outtextxy(plotX - 32, plotY - 8, buf);
-            _stprintf_s(buf, 64, _T("%.1f"), 0.0);
-            outtextxy(plotX - 28, plotY + plotH - 14, buf);
-
-            _stprintf_s(buf, 64, _T("%.1fs"), t0);
-            outtextxy(plotX + 2, plotY + plotH + 2, buf);
-            _stprintf_s(buf, 64, _T("%.1fs"), simTime);
-            outtextxy(plotX + plotW - 40, plotY + plotH + 2, buf);
-
-            _stprintf_s(buf, 64, _T("Speed (m/s)"));
-            outtextxy(plotX + 2, plotY - 18, buf);
-            _stprintf_s(buf, 64, _T("Time (s)"));
-            outtextxy(plotX + plotW / 2 - 22, plotY + plotH + 2, buf);
-
-            if (speedData.size() >= 2) {
-                legacySetColor(RGB(255, 0, 0));
-                setlinestyle(PS_SOLID, 2);
-                for (size_t i = 1; i < speedData.size(); ++i) {
-                    double tx1 = speedData[i - 1].t;
-                    double ty1 = speedData[i - 1].s;
-                    double tx2 = speedData[i].t;
-                    double ty2 = speedData[i].s;
-
-                    double nx1 = plotX + (tx1 - (simTime - graphWindow)) / graphWindow * plotW;
-                    double nx2 = plotX + (tx2 - (simTime - graphWindow)) / graphWindow * plotW;
-                    double ny1 = plotY + plotH - (ty1 / yMax) * plotH;
-                    double ny2 = plotY + plotH - (ty2 / yMax) * plotH;
-
-                    if (nx1 < plotX) nx1 = plotX;
-                    if (nx1 > plotX + plotW) nx1 = plotX + plotW;
-                    if (nx2 < plotX) nx2 = plotX;
-                    if (nx2 > plotX + plotW) nx2 = plotX + plotW;
-                    if (ny1 < plotY) ny1 = plotY;
-                    if (ny1 > plotY + plotH) ny1 = plotY + plotH;
-                    if (ny2 < plotY) ny2 = plotY;
-                    if (ny2 > plotY + plotH) ny2 = plotY + plotH;
-
-                    line((int)nx1, (int)ny1, (int)nx2, (int)ny2);
-                }
-                setlinestyle(PS_SOLID, 1);
-            }
-
-            FlushBatchDraw();
-            Sleep(16);
-        }
-        else {
-            FlushBatchDraw();
-            Sleep(50);
-        }
-
-        if (!stone.isMoving() && !paused) {
-            legacySetColor(RGB(0, 255, 0));
-            settextstyle(16, 0, _T("Consolas"));
-            outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Stone Stopped! Press R to restart"));
-        }
-    }
-
-    closegraph();
-    return 0;
-}
-
-// ==================== entry.hpp ====================
-
-#ifdef _WIN32
-#include <windows.h>
-namespace rock {
-inline int windowsEntry(int argc,wchar_t** argv,int (*animation)()) {
-    SetConsoleOutputCP(CP_UTF8);
-    std::vector<std::string> arguments;
-    for(int i=0;i<argc;++i){
-        const int bytes=WideCharToMultiByte(CP_UTF8,0,argv[i],-1,nullptr,0,nullptr,nullptr);
-        if(bytes<=0){std::cerr<<"Invalid Unicode argument\n";return 2;}
-        std::string a(static_cast<size_t>(bytes),'\0');
-        WideCharToMultiByte(CP_UTF8,0,argv[i],-1,&a[0],bytes,nullptr,nullptr);
-        a.pop_back();arguments.push_back(std::move(a));
-    }
-    auto execute=[](std::vector<std::string>& args){std::vector<char*> pointers;for(auto& a:args)pointers.push_back(a.data());return runCommandLine(static_cast<int>(pointers.size()),pointers.data());};
-    if(argc>1)return execute(arguments);
-    for(;;){
-        std::cout<<"\n山区滚石模拟 - 前三项任务（全部 C++）\n"
-          <<"1. 随机模拟 + 坡脚路线概率 + CSV导出\n"
-          <<"2. 参数影响分析（初速、滚动阻力、摩擦、恢复系数、空气阻力）\n"
-          <<"3. 查看原有单次动画演示\n0. 退出\n请选择：";
-        std::string choice;if(!std::getline(std::cin,choice)||choice=="0")return 0;
-        if(choice=="3"){if(animation)return animation();std::cout<<"此构建不含图形演示。\n";continue;}
-        if(choice!="1"&&choice!="2"){std::cout<<"请输入 0、1、2 或 3。\n";continue;}
-        std::string n,seed,cv;
-        std::cout<<"每组试验次数 [默认200]：";if(!std::getline(std::cin,n))return 0;
-        std::cout<<"随机种子 [默认42]：";if(!std::getline(std::cin,seed))return 0;
-        std::cout<<"变异系数 [默认0.1]：";if(!std::getline(std::cin,cv))return 0;
-        std::vector<std::string> args={arguments[0],choice=="1"?"--batch":"--study","--runs",n.empty()?"200":n,"--seed",seed.empty()?"42":seed,"--cv",cv.empty()?"0.1":cv};
-        execute(args);
-    }
-}
-}
+// Native EasyX front end. The renderer reads the very same samples used by CSV export.
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#include <easyx.h>
+#include <chrono>
+#include <filesystem>
+#include <future>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
 
-int wmain(int argc,wchar_t** argv) { return rock::windowsEntry(argc,argv,originalViewer); }
+namespace rock { namespace ui {
+constexpr int W=1300,H=850,SIDE=342;
+const COLORREF BG=RGB(13,23,36),PANEL=RGB(22,36,52),INK=RGB(226,236,244),MUTED=RGB(145,165,184);
+const COLORREF ACCENT=RGB(69,211,175),SKYBLUE=RGB(80,169,244),ORANGE=RGB(255,174,83);
+struct Rect {int l,t,r,b; bool contains(int x,int y)const{return x>=l&&x<=r&&y>=t&&y<=b;}};
+inline std::wstring wide(const std::string& s){
+    if(s.empty())return L"";
+    int n=MultiByteToWideChar(CP_UTF8,0,s.data(),static_cast<int>(s.size()),nullptr,0);
+    if(n<=0)return L"无法显示的文本";
+    std::wstring w(static_cast<size_t>(n),L' ');
+    MultiByteToWideChar(CP_UTF8,0,s.data(),static_cast<int>(s.size()),&w[0],n);return w;
+}
+inline std::wstring num(double v,int precision=2){std::wostringstream s;s<<std::fixed<<std::setprecision(precision)<<v;return s.str();}
+inline void text(int x,int y,const std::wstring& s,int size=17,COLORREF color=INK){settextstyle(static_cast<int>(size*1.3),0,L"Microsoft YaHei");settextcolor(color);setbkmode(TRANSPARENT);outtextxy(x,y,s.c_str());}
+inline void box(Rect r,COLORREF color){setfillcolor(color);solidrectangle(r.l,r.t,r.r,r.b);}
+inline void lineAt(int x1,int y1,int x2,int y2,COLORREF c,int thickness=1){setlinecolor(c);setlinestyle(PS_SOLID,thickness);line(x1,y1,x2,y2);}
+inline void button(Rect r,const std::wstring& label,bool selected=false,bool disabled=false){box(r,disabled?RGB(32,44,58):(selected?RGB(30,97,88):RGB(40,58,77)));text(r.l+9,r.t+7,label,16,disabled?MUTED:(selected?ACCENT:INK));}
+inline std::wstring stopName(const RunResult& r){
+    if(r.status=="time_limit")return L"达到时间上限";
+    if(r.status=="domain_exit")return L"离开计算域";
+    if(r.status=="stopped")return L"自然停稳";
+    return wide(r.status);
+}
+struct Row {std::wstring name,value;};
+struct StudyRow {
+    std::string factor,level,metric;
+    int valid=0;
+    double mean=0,low=0,high=0;
+    bool available=false;
+};
+struct StudyData {
+    Config base;
+    int count=0;
+    uint32_t seed=0;
+    std::string directory;
+    std::vector<StudyRow> rows;
+    const StudyRow* find(const std::string& factor,const std::string& level,const std::string& metric)const{
+        for(const auto& r:rows)if(r.factor==factor&&r.level==level&&r.metric==metric)return &r;
+        return nullptr;
+    }
+};
+inline StudyData readStudy(const Config& c,int count,uint32_t seed,const std::string& directory){
+    StudyData data;data.base=c;data.count=count;data.seed=seed;data.directory=directory;
+    std::ifstream file(pathFromUtf8(directory)/"parameter_study.csv");
+    if(!file)throw std::runtime_error("Cannot read parameter_study.csv");
+    std::string line;std::getline(file,line);
+    while(std::getline(file,line)){
+        std::vector<std::string> fields;std::istringstream input(line);std::string field;
+        while(std::getline(input,field,','))fields.push_back(field);
+        if(fields.size()<11)continue;
+        StudyRow row;row.factor=fields[0];row.level=fields[1];row.metric=fields[4];
+        row.valid=std::stoi(fields[5]);row.available=!fields[6].empty()&&!fields[9].empty()&&!fields[10].empty();
+        if(row.available){row.mean=std::stod(fields[6]);row.low=std::stod(fields[9]);row.high=std::stod(fields[10]);}
+        data.rows.push_back(row);
+    }
+    if(data.rows.size()!=165)throw std::runtime_error("Incomplete parameter study table");
+    return data;
+}
+struct View {
+    Config pending;
+    BatchResult batch;
+    int count=200,page=0,chosenRow=0,trial=0,speedIndex=0,factorIndex=0;
+    uint32_t seed=42;
+    bool playing=true,dirty=false,studyDirty=false,analysisMode=false,heat=false,overlay=true,scrubbing=false;
+    double time=0;
+    int materialPreset=1;
+    std::wstring note=L"默认运行 200 次随机试验，CV=0.1；画布与 CSV 使用同一批轨迹。";
+    std::filesystem::path lastOutput;
+    std::future<BatchResult> future;
+    StudyData study;
+    std::future<StudyData> studyFuture;
+    std::chrono::steady_clock::time_point jobStart;
+    Rect plot{370,138,1266,518},timeline{376,564,1260,588};
+    double worldLeft=0,worldRight=180,worldBottom=-4,worldTop=65;
+    const double speeds[5]={.25,.5,1,2,4};
+    View(){pending.randomSurface=true; speedIndex=2;}
+    bool busy()const{return future.valid()||studyFuture.valid();}
+    bool hasData()const{return !batch.runs.empty();}
+    const RunResult& current()const{return batch.runs[static_cast<size_t>(trial)];}
+    const Config& shown()const{return hasData()?batch.base:pending;}
+    Config config()const{
+        Config c=pending;
+        c.terrain.surfaces.clear(); // The selected material applies uniformly to this scenario.
+        return c;
+    }
+    std::vector<Row> rows()const{
+        const auto& c=pending;
+        if(page==0)return {{L"试验次数 N",num(count,0)},{L"随机种子",num(seed,0)},{L"初始速度 m/s",num(c.initialSpeed)},{L"等效半径 m",num(c.radius)},{L"变异系数 CV",num(c.cv)},{L"最长时长 s",num(c.maxTime,0)},{L"积分步长 ms",num(c.dt*1000,1)},{L"播放倍速",num(speeds[speedIndex])+L"×"}};
+        if(page==1)return {{L"地表预设",materialPreset==1?L"岩石":materialPreset==2?L"土层":materialPreset==3?L"草地":L"自定义"},{L"滚动阻力",num(c.material.rollResistance,3)},{L"滑动摩擦",num(c.material.friction)},{L"恢复系数",num(c.material.restitution)},{L"空气阻力 Cd",num(c.material.drag)},{L"材质随机化",c.randomSurface?L"开":L"关"}};
+        return {{L"高度分箱 m",num(c.binHeight)},{L"路径网格宽 m",num(c.gridWidth)}};
+    }
+    void adjust(int dir){
+        if(busy())return;
+        auto clamp=[](double v,double lo,double hi){return std::clamp(v,lo,hi);};
+        auto& c=pending;
+        if(page==0){switch(chosenRow){
+            case 0:count=std::clamp(count+dir*25,1,1000);break;
+            case 1:seed=dir<0?(seed>0?seed-1:0):seed+1;break;
+            case 2:c.initialSpeed=clamp(c.initialSpeed+dir*.5,0,50);break;
+            case 3:c.radius=clamp(c.radius+dir*.1,.2,3);break;
+            case 4:c.cv=clamp(c.cv+dir*.01,0,.5);break;
+            case 5:c.maxTime=clamp(c.maxTime+dir*10,10,180);break;
+            case 6:c.dt=clamp(c.dt+dir*.0005,.0005,.005);break;
+            case 7:speedIndex=std::clamp(speedIndex+dir,0,4);return;}}
+        if(page==1){switch(chosenRow){
+            case 0:materialPreset=(materialPreset+dir+4)%4;
+                if(materialPreset==1)c.material={.02,.45,.45,1.};
+                if(materialPreset==2)c.material={.08,.60,.25,1.};
+                if(materialPreset==3)c.material={.12,.75,.20,1.};break;
+            case 1:c.material.rollResistance=clamp(c.material.rollResistance+dir*.005,0,.3);materialPreset=0;break;
+            case 2:c.material.friction=clamp(c.material.friction+dir*.025,0,1.5);materialPreset=0;break;
+            case 3:c.material.restitution=clamp(c.material.restitution+dir*.025,0,.95);materialPreset=0;break;
+            case 4:c.material.drag=clamp(c.material.drag+dir*.1,0,3);materialPreset=0;break;
+            case 5:c.randomSurface=!c.randomSurface;break;}}
+        if(page==2){switch(chosenRow){
+            case 0:c.binHeight=clamp(c.binHeight+dir*.25,.25,2);break;
+            case 1:c.gridWidth=clamp(c.gridWidth+dir*.5,.5,5);break;}}
+        dirty=true;studyDirty=true;note=L"设置已修改：当前图仍为旧结果；按 B 重算轨迹，按 A 重算参数对照。";
+    }
+    void begin(bool many){
+        if(busy())return;
+        Config c=config();if(!many)c.cv=0;
+        try{validate(c);}catch(const std::exception& e){note=L"参数错误："+wide(e.what());return;}
+        const int n=many?count:1;const uint32_t s=seed;
+        jobStart=std::chrono::steady_clock::now();
+        future=std::async(std::launch::async,[c,n,s]{return runBatch(c,n,s);});
+        analysisMode=false;
+        note=many?L"正在批量计算；可继续查看现有回放。":L"正在计算固定参数单次轨迹。";
+    }
+    void beginStudy(){
+        if(busy())return;
+        if(count<2){note=L"参数分析每组至少需要 2 次试验；请增加 N。";return;}
+        Config c=config();c.randomSurface=true;
+        try{validate(c);}catch(const std::exception& e){note=L"参数错误："+wide(e.what());return;}
+        const int n=count;const uint32_t s=seed;
+        const std::string out=newResultPath("parameters_viewer");
+        jobStart=std::chrono::steady_clock::now();
+        studyFuture=std::async(std::launch::async,[c,n,s,out]{
+            runParameterStudy(c,n,s,out);return readStudy(c,n,s,out);
+        });
+        analysisMode=true;note=L"正在比较 5 个参数 × 3 个水平；完成后显示均值与 95% 置信区间。";
+    }
+    void poll(){
+        if(future.valid()&&future.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
+            try{batch=future.get();trial=0;time=0;playing=true;dirty=false;note=L"计算完成。PageUp / PageDown 选择试验；拖动时间轴回放。";}
+            catch(const std::exception& e){note=L"计算失败："+wide(e.what());}
+        }
+        if(studyFuture.valid()&&studyFuture.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
+            try{study=studyFuture.get();studyDirty=false;analysisMode=true;
+                lastOutput=std::filesystem::absolute(pathFromUtf8(study.directory));
+                note=L"参数对照完成；选择上方参数查看 0.8 / 1.0 / 1.2 倍结果，CSV 已自动保存。";}
+            catch(const std::exception& e){note=L"参数分析失败："+wide(e.what());}
+        }
+    }
+    void exportData(){
+        if(!hasData()||busy())return;
+        try{
+            std::string out=newResultPath("viewer");
+            exportBatch(batch,out);lastOutput=std::filesystem::absolute(pathFromUtf8(out));
+            note=L"当前画布对应的批量 CSV 已导出；点击“输出目录 O”查看文件。";
+        }catch(const std::exception& e){note=L"导出失败："+wide(e.what());}
+    }
+    void openOutput(){if(!lastOutput.empty())ShellExecuteW(nullptr,L"open",lastOutput.c_str(),nullptr,nullptr,SW_SHOWNORMAL);}
+    void selectTrial(int dir){if(!hasData())return;trial=(trial+dir+static_cast<int>(batch.runs.size()))%static_cast<int>(batch.runs.size());time=0;playing=false;}
+    Sample sample()const{
+        if(!hasData()||current().trajectory.empty())return {};
+        const auto& a=current().trajectory;
+        auto it=std::lower_bound(a.begin(),a.end(),time,[](const Sample& p,double t){return p.t<t;});
+        if(it==a.begin())return *it;if(it==a.end())return a.back();
+        const auto& p=*(it-1);const auto& q=*it;double f=(time-p.t)/(q.t-p.t);
+        Sample r;double* dst[]={&r.x,&r.z,&r.vx,&r.vz,&r.angle,&r.omega,&r.energy,&r.deflection};
+        const double pv[]={p.x,p.z,p.vx,p.vz,p.angle,p.omega,p.energy,p.deflection};
+        const double qv[]={q.x,q.z,q.vx,q.vz,q.angle,q.omega,q.energy,q.deflection};
+        for(int i=0;i<8;++i)*dst[i]=pv[i]+f*(qv[i]-pv[i]);r.t=time;return r;
+    }
+    int px(double x)const{return plot.l+static_cast<int>((x-worldLeft)/(worldRight-worldLeft)*(plot.r-plot.l));}
+    int py(double z)const{return plot.b-static_cast<int>((z-worldBottom)/(worldTop-worldBottom)*(plot.b-plot.t));}
+    void fit(){
+        const auto& c=shown();worldLeft=c.terrain.points.front().x-5;worldRight=c.terrain.toeX()+35;worldBottom=c.terrain.toeZ()-4;worldTop=c.terrain.points.front().z+10;
+        if(hasData())for(const auto& r:batch.runs){worldRight=(std::max)(worldRight,r.runoutX+5);for(const auto& p:r.trajectory)worldTop=(std::max)(worldTop,p.z+3);}
+        // One metre has the same pixel length on both axes, preserving rock geometry.
+        const double scale=(std::min)((plot.r-plot.l)/(worldRight-worldLeft),(plot.b-plot.t)/(worldTop-worldBottom));
+        worldRight=worldLeft+(plot.r-plot.l)/scale;worldTop=worldBottom+(plot.b-plot.t)/scale;
+    }
+    void path(const RunResult& r,COLORREF color,double until=-1,int thickness=1){
+        setlinecolor(color);setlinestyle(PS_SOLID,thickness);
+        const auto& a=r.trajectory;
+        for(size_t i=1;i<a.size();++i){if(until>=0&&a[i-1].t>until)break;line(px(a[i-1].x),py(a[i-1].z),px(a[i].x),py(a[i].z));}
+    }
+    void renderScene(){
+        const auto& c=shown();fit();box(plot,RGB(17,30,46));
+        // Axes use world metres; all panels share the core's upward-positive elevation convention.
+        for(double x=0;x<worldRight;x+=20){lineAt(px(x),plot.t,px(x),plot.b,RGB(33,49,65));text(px(x)-7,plot.b+6,num(x,0),13,MUTED);}
+        for(double z=std::ceil(worldBottom/10)*10;z<worldTop;z+=10){lineAt(plot.l,py(z),plot.r,py(z),RGB(33,49,65));text(plot.l+4,py(z)+1,num(z,0)+L" m",12,MUTED);}
+        // Heat maps show P(a trial visits this cell), not dwell-time density.
+        if(heat&&hasData())for(const auto& [cell,n]:batch.routeCells){
+            const double p=static_cast<double>(n)/batch.runs.size();
+            double x=cell.first*c.gridWidth,z=c.terrain.toeZ()+cell.second*c.binHeight;
+            int left=(std::max)(plot.l,px(x)),right=(std::min)(plot.r,px(x+c.gridWidth));
+            int top=(std::max)(plot.t,py(z+c.binHeight)),bottom=(std::min)(plot.b,py(z));
+            if(left<right&&top<bottom)box({left,top,right,bottom},RGB(static_cast<int>(50+200*p),static_cast<int>(85+80*(1-p)),static_cast<int>(100*(1-p))));
+        }
+        const auto& pts=c.terrain.points;
+        std::vector<POINT> land;land.push_back({px(worldLeft),plot.b});land.push_back({px(worldLeft),py(pts.front().z)});
+        for(const auto& p:pts)land.push_back({px(p.x),py(p.z)});
+        land.push_back({px(worldRight),py(c.terrain.toeZ())});land.push_back({px(worldRight),plot.b});
+        setfillcolor(RGB(56,65,67));solidpolygon(land.data(),static_cast<int>(land.size()));
+        for(size_t i=1;i<pts.size();++i)lineAt(px(pts[i-1].x),py(pts[i-1].z),px(pts[i].x),py(pts[i].z),ACCENT,3);
+        lineAt(px(c.terrain.toeX()),py(c.terrain.toeZ()),plot.r,py(c.terrain.toeZ()),ACCENT,3);
+        const double detector=c.detectorX<0?c.terrain.toeX():c.detectorX;
+        lineAt(px(detector),py(c.terrain.toeZ()),px(detector),py(c.terrain.toeZ()+10),SKYBLUE,3);
+        text(px(detector)-48,py(c.terrain.toeZ()+10)-24,L"坡脚 0–10 m",14,SKYBLUE);
+        if(overlay&&hasData()){
+            for(const auto& run:batch.runs)path(run,RGB(160,85,78));
+        }
+        if(hasData()){
+            const auto p=sample();path(current(),ORANGE,time,2);
+            const auto& rc=current().config;
+            const int rx=(std::max)(3,px(p.x+rc.radius)-px(p.x));
+            const int ry=(std::max)(3,py(p.z)-py(p.z+rc.radius));
+            setfillcolor(RGB(224,229,233));solidellipse(px(p.x)-rx,py(p.z)-ry,px(p.x)+rx,py(p.z)+ry);
+            lineAt(px(p.x),py(p.z),px(p.x+rc.radius*std::cos(p.angle)),py(p.z+rc.radius*std::sin(p.angle)),BG,2);
+        }
+        text(plot.r-151,plot.t+9,L"水平距离 x / m",13,MUTED);
+    }
+    void sidebar(){
+        box({14,94,328,806},PANEL);text(28,105,L"试验设置",19);
+        const wchar_t* tabs[]={L"实验",L"地表",L"统计"};
+        for(int i=0;i<3;++i)button({22+i*100,139,116+i*100,171},tabs[i],page==i,busy());
+        const auto list=rows();
+        for(int i=0;i<static_cast<int>(list.size());++i){int y=186+i*43;
+            if(i==chosenRow)box({22,y-1,320,y+38},RGB(31,53,70));
+            text(29,y+8,list[i].name,15);text(171,y+8,list[i].value,15,ACCENT);
+            button({265,y+2,289,y+32},L"−",false,busy());button({292,y+2,316,y+32},L"+",false,busy());}
+        button({24,555,116,593},L"单次 Enter",false,busy());button({121,555,214,593},L"批量 B",true,busy());button({219,555,316,593},L"导出 E",false,busy()||!hasData());
+        button({24,605,316,646},L"参数对照 A  ·  5 参数 × 3 水平",false,busy());
+        text(27,660,L"↑↓ 选参数   ←→ 调整   Tab 切页",14,MUTED);
+        text(27,685,L"PageUp / PageDown 选择试验",14,MUTED);
+        text(27,710,L"空格 暂停   J / L 前后定位",14,MUTED);
+        text(27,738,L"批量按 CV 抽样；单次使用均值",14,MUTED);
+        text(27,763,L"V 切换图表   O 输出目录",14,MUTED);
+        text(27,784,L"球体 · 固定地形 · 前三项任务",12,ACCENT);
+        if(page==2){text(29,300,L"蓝线：坡脚石心高度 0–10 m",14,SKYBLUE);
+            text(29,330,L"分箱概率 = 本箱次数 / 全部 N 次",14,MUTED);
+            text(29,360,L"每条轨迹仅统计首次向右通过",14,MUTED);
+            text(29,390,L"热力图：轨迹访问网格的概率",14,MUTED);}
+    }
+    void histogram(){
+        Rect area{370,617,826,798};box(area,PANEL);text(385,627,L"首次通过坡脚断面的路线概率",17);
+        if(!hasData())return;
+        const int n=static_cast<int>(batch.heightCounts.size());if(n==0)return;
+        int left=400,top=666,bottom=763,right=810;double maxP=.05;
+        for(int v:batch.heightCounts)maxP=(std::max)(maxP,static_cast<double>(v)/batch.runs.size());
+        for(int i=0;i<n;++i){double p=static_cast<double>(batch.heightCounts[i])/batch.runs.size();
+            int x0=left+static_cast<int>((std::min)(10.,i*batch.base.binHeight)/10*(right-left));
+            int x1=left+static_cast<int>((std::min)(10.,(i+1)*batch.base.binHeight)/10*(right-left))-2;
+            if(p>0)box({x0,bottom-static_cast<int>((bottom-top)*p/maxP),(std::max)(x0+1,x1),bottom},SKYBLUE);}
+        lineAt(left,bottom,right,bottom,MUTED);text(379,652,num(maxP*100,1)+L"%",12,MUTED);
+        for(int i=0;i<=5;++i)text(left+i*(right-left)/5-5,bottom+6,num(i*2,0),12,MUTED);
+        text(605,782,L"石心高度 m；分母为全部 N 次",12,MUTED);
+    }
+    void statistics(){
+        box({842,617,1266,798},PANEL);text(858,627,L"本次试验记录",17);
+        if(!hasData())return;
+        const auto& r=current();const size_t n=batch.runs.size();
+        text(858,658,L"0–10 m 内通过："+num(static_cast<double>(batch.inBand),0)+L" / "+num(static_cast<double>(n),0)+L"  ("+num(100.*batch.inBand/n,1)+L"%)",15,ACCENT);
+        text(858,683,L"未到达 "+num(static_cast<double>(batch.notReached),0)+L"    超高 "+num(static_cast<double>(batch.aboveBand),0)+L"    低于范围 "+num(static_cast<double>(batch.belowBand),0),14,MUTED);
+        text(858,708,L"当前试验："+stopName(r)+L"，最大速度 "+num(r.maxSpeed,1)+L" m/s",14);
+        text(858,733,r.reached?L"通过高度 "+num(r.detectorHeight)+L" m    速度 "+num(r.detectorSpeed,1)+L" m/s":L"当前试验未到达坡脚检测断面",14);
+        text(858,758,r.reached?L"坡脚动能 "+num(r.detectorEnergy/1000000.,3)+L" MJ    首次通过 t="+num(r.detectorTime,1)+L" s":L"条件速度和动能不计入未到达试验",14);
+        text(858,781,L"seed="+num(batch.seed,0)+L"   CV="+num(batch.base.cv)+L"   N="+num(static_cast<double>(n),0),12,MUTED);
+    }
+    void studyChart(Rect area,int metricIndex){
+        const char* factors[]={"initial_speed","roll_resistance","friction","restitution","drag"};
+        const char* metrics[]={"collector_speed_given_reached_m_s","collector_energy_given_reached_J","height_0_10m_probability"};
+        const wchar_t* titles[]={L"到达样本：坡脚速度",L"到达样本：坡脚动能",L"全部试验：0–10 m 通过率"};
+        const wchar_t* units[]={L"m/s",L"MJ",L"%"};
+        const char* levels[]={"0.8","1.0","1.2"};
+        const double multiplier=metricIndex==1?1e-6:metricIndex==2?100.:1.;
+        box(area,PANEL);text(area.l+12,area.t+12,titles[metricIndex],14);
+        double maximum=metricIndex==2?100.:.001;
+        for(int j=0;j<3;++j){const auto* r=study.find(factors[factorIndex],levels[j],metrics[metricIndex]);
+            if(metricIndex!=2&&r&&r->available)maximum=(std::max)(maximum,(std::max)(r->mean,r->high)*multiplier*1.2);}
+        const int top=area.t+75,bottom=area.b-48;
+        auto yy=[&](double value){return bottom-static_cast<int>((bottom-top)*std::clamp(value/maximum,0.,1.));};
+        text(area.l+12,area.t+41,L"0 – "+num(maximum,metricIndex==2?0:2)+L" "+units[metricIndex],12,MUTED);
+        lineAt(area.l+18,bottom,area.r-14,bottom,MUTED);
+        for(int j=0;j<3;++j){int center=area.l+54+j*84;
+            const auto* r=study.find(factors[factorIndex],levels[j],metrics[metricIndex]);
+            if(r&&r->available){
+                const double value=r->mean*multiplier;
+                box({center-21,yy(value),center+21,bottom},j==1?ACCENT:j==0?SKYBLUE:ORANGE);
+                int high=yy(r->high*multiplier),low=yy(r->low*multiplier);
+                lineAt(center,high,center,low,INK,2);lineAt(center-7,high,center+7,high,INK,2);lineAt(center-7,low,center+7,low,INK,2);
+                text(center-30,(std::max)(top-24,high-25),num(value,metricIndex==2?1:2),13);
+            }else text(center-22,top+60,L"无到达",12,MUTED);
+            text(center-23,bottom+10,j==0?L"0.8×":j==1?L"1.0×":L"1.2×",14,j==1?ACCENT:INK);
+            if(r)text(center-20,bottom+31,L"n="+num(r->valid,0),10,MUTED);
+        }
+    }
+    void renderStudy(){
+        box({370,138,1266,798},RGB(17,30,46));
+        const wchar_t* names[]={L"初始速度",L"滚动阻力",L"滑动摩擦",L"恢复系数",L"空气阻力"};
+        const char* factors[]={"initial_speed","roll_resistance","friction","restitution","drag"};
+        for(int i=0;i<5;++i)button({380+i*175,149,548+i*175,184},names[i],factorIndex==i);
+        if(study.rows.empty()){
+            text(410,280,studyFuture.valid()?L"正在计算参数对照… 画布仍可操作":L"点击左侧“参数对照 A”开始研究",23,ACCENT);
+            text(410,330,L"逐个参数取 0.8 / 1.0 / 1.2 倍均值；其他参数保持基准。",17,MUTED);
+            text(410,368,L"每组 N 次，使用相同种子；完成后显示均值和 95% 置信区间。",17,MUTED);
+            text(410,406,L"统计 CSV 与图表来自同一参数研究核心。",17,MUTED);return;
+        }
+        text(385,197,L"每组 N="+num(study.count,0)+L"   seed="+num(study.seed,0)+L"   CV="+num(study.base.cv)+L"   竖线：95% 置信区间",15,MUTED);
+        text(385,223,studyDirty?L"设置已修改：以下仍是上次研究，请按 A 重新计算。":L"0.8× / 1.0× / 1.2× 对照；仅改变当前参数的均值。",14,studyDirty?ORANGE:ACCENT);
+        studyChart({380,253,665,549},0);studyChart({674,253,959,549},1);studyChart({968,253,1256,549},2);
+        const double bases[]={study.base.initialSpeed,study.base.material.rollResistance,study.base.material.friction,study.base.material.restitution,study.base.material.drag};
+        text(386,563,std::wstring(names[factorIndex])+L"的基准均值 = "+num(bases[factorIndex],3)+L"；下表为均值 [95% 区间]",15);
+        text(387,596,L"水平 / 均值",13,MUTED);text(535,596,L"速度 m/s",13,MUTED);text(789,596,L"动能 MJ",13,MUTED);text(1040,596,L"通过率 %",13,MUTED);
+        const char* levels[]={"0.8","1.0","1.2"};
+        const char* metrics[]={"collector_speed_given_reached_m_s","collector_energy_given_reached_J","height_0_10m_probability"};
+        for(int j=0;j<3;++j){int y=624+j*31;
+            text(387,y,num(.8+j*.2,1)+L" / "+num(bases[factorIndex]*(.8+j*.2),3),13,j==1?ACCENT:INK);
+            for(int k=0;k<3;++k){const auto* r=study.find(factors[factorIndex],levels[j],metrics[k]);const double scale=k==1?1e-6:k==2?100.:1.;
+                std::wstring value=r&&r->available?num(r->mean*scale,k==2?1:2)+L" ["+num(r->low*scale,k==2?1:2)+L", "+num(r->high*scale,k==2?1:2)+L"]":L"无到达样本";
+                text(535+k*252,y,value,12,j==1?ACCENT:INK);}
+        }
+        text(385,727,L"速度 / 动能仅统计到达者；通过率分母为全部 N 次（未到达计为未通过）。",13,MUTED);
+        text(385,751,L"正态抽样，越界重采样；CV = 标准差 / 均值。完整数据及配对效应已写入 CSV。",13,MUTED);
+        text(385,775,L"点击上方五个参数切换对照图；V 返回批量轨迹。",13,ACCENT);
+    }
+    void render(){
+        setbkcolor(BG);cleardevice();
+        text(24,20,L"山区滚石 · 随机试验",29);text(26,60,L"任务 1 路线概率   /   任务 2 CSV 导出   /   任务 3 参数分析",15,MUTED);
+        if(busy()){
+            double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-jobStart).count();
+            text(650,28,(studyFuture.valid()?L"参数分析中… ":L"批量计算中… ")+num(elapsed,1)+L" s",19,ORANGE);
+        }else {const bool stale=analysisMode?studyDirty:dirty;
+            text(650,28,stale?L"当前显示旧结果，设置尚未重算":L"图表与 CSV 使用同一计算结果",16,stale?ORANGE:ACCENT);}
+        button({1070,20,1265,58},L"输出目录 O",false,lastOutput.empty());
+        sidebar();
+        button({370,94,476,128},playing?L"暂停 Space":L"播放 Space",playing);
+        button({484,94,579,128},L"重播 R");button({587,94,696,128},L"轨迹叠加 T",overlay);
+        button({704,94,815,128},L"热力图 H",heat);
+        button({825,94,906,128},L"上一条");button({914,94,996,128},L"下一条");
+        button({1007,94,1122,128},L"轨迹视图",!analysisMode);button({1130,94,1266,128},L"参数对照 V",analysisMode);
+        if(analysisMode)renderStudy();else{
+        renderScene();
+        if(hasData()){
+            auto p=sample();const auto& a=current().trajectory;double end=a.empty()?0:a.back().t;
+            text(376,539,L"试验 "+num(trial+1,0)+L"/"+num(static_cast<double>(batch.runs.size()),0)+L"   t="+num(time)+L"/"+num(end)+L" s   速度 "+num(std::hypot(p.vx,p.vz))+L" m/s   动能 "+num(p.energy/1000.,1)+L" kJ",15);
+            box(timeline,RGB(36,55,74));int xx=timeline.l+static_cast<int>((timeline.r-timeline.l)*(end>0?time/end:0));box({timeline.l,timeline.t,xx,timeline.b},RGB(38,117,113));
+            setfillcolor(ACCENT);solidcircle(xx,(timeline.t+timeline.b)/2,7);text(376,593,L"拖动时间轴逐帧查看；热力图为每条轨迹是否访问网格的概率。",12,MUTED);
+        }
+        histogram();statistics();}
+        text(24,818,note.substr(0,90),15,busy()?ORANGE:MUTED);
+        FlushBatchDraw();
+    }
+    void scrub(int x){if(!hasData()||current().trajectory.empty())return;double f=std::clamp(static_cast<double>(x-timeline.l)/(timeline.r-timeline.l),0.,1.);time=f*current().trajectory.back().t;playing=false;}
+    void mouse(const ExMessage& m){
+        if(m.message==WM_LBUTTONUP){scrubbing=false;return;}
+        if(m.message==WM_MOUSEMOVE&&scrubbing){scrub(m.x);return;}
+        if(m.message!=WM_LBUTTONDOWN)return;
+        int x=m.x,y=m.y;
+        if(!analysisMode&&timeline.contains(x,y)){scrubbing=true;scrub(x);return;}
+        if(Rect{1007,94,1122,128}.contains(x,y)){analysisMode=false;return;}
+        if(Rect{1130,94,1266,128}.contains(x,y)){analysisMode=true;return;}
+        if(analysisMode)for(int i=0;i<5;++i)if(Rect{380+i*175,149,548+i*175,184}.contains(x,y)){factorIndex=i;return;}
+        if(Rect{370,94,476,128}.contains(x,y)){playing=!playing;return;}
+        if(Rect{484,94,579,128}.contains(x,y)){time=0;playing=true;return;}
+        if(Rect{587,94,696,128}.contains(x,y)){overlay=!overlay;return;}
+        if(Rect{704,94,815,128}.contains(x,y)){heat=!heat;return;}
+        if(Rect{825,94,906,128}.contains(x,y)){selectTrial(-1);return;}
+        if(Rect{914,94,996,128}.contains(x,y)){selectTrial(1);return;}
+        if(Rect{1070,20,1265,58}.contains(x,y)){openOutput();return;}
+        if(busy())return;
+        for(int i=0;i<3;++i)if(Rect{22+i*100,139,116+i*100,171}.contains(x,y)){page=i;chosenRow=0;return;}
+        const auto list=rows();for(int i=0;i<static_cast<int>(list.size());++i){int yy=186+i*43;
+            if(Rect{22,yy,320,yy+38}.contains(x,y)){chosenRow=i;if(x>=292)adjust(1);else if(x>=265)adjust(-1);return;}}
+        if(Rect{24,555,116,593}.contains(x,y))begin(false);
+        if(Rect{121,555,214,593}.contains(x,y))begin(true);
+        if(Rect{219,555,316,593}.contains(x,y))exportData();
+        if(Rect{24,605,316,646}.contains(x,y))beginStudy();
+    }
+    void key(int k){
+        if(k=='V'){analysisMode=!analysisMode;return;}
+        if(k=='O'){openOutput();return;}
+        if(analysisMode&&k>='1'&&k<='5'){factorIndex=k-'1';return;}
+        if(k==VK_SPACE){playing=!playing;return;}
+        if(k=='R'){time=0;playing=true;return;}
+        if(k=='T'){overlay=!overlay;return;}if(k=='H'){heat=!heat;return;}
+        if(k==VK_PRIOR){selectTrial(-1);return;}if(k==VK_NEXT){selectTrial(1);return;}
+        if((k=='J'||k=='L')&&hasData()&&!current().trajectory.empty()){time=std::clamp(time+(k=='J'?-1.:1.),0.,current().trajectory.back().t);playing=false;return;}
+        if(busy())return;
+        if(k==VK_RETURN)begin(false);else if(k=='B')begin(true);else if(k=='E')exportData();else if(k=='A')beginStudy();
+        else if(k==VK_TAB){page=(page+1)%3;chosenRow=0;}
+        else if(k==VK_UP)chosenRow=(chosenRow+static_cast<int>(rows().size())-1)%static_cast<int>(rows().size());
+        else if(k==VK_DOWN)chosenRow=(chosenRow+1)%static_cast<int>(rows().size());
+        else if(k==VK_LEFT)adjust(-1);else if(k==VK_RIGHT)adjust(1);
+    }
+};
+} // namespace ui
+
+inline int runViewer(){
+    HWND window=initgraph(ui::W,ui::H);SetWindowTextW(window,L"山区滚石模拟 — 前三项任务 · v1.3.3");BeginBatchDraw();
+    ui::View view;view.begin(true);auto last=std::chrono::steady_clock::now();bool quit=false;
+    while(!quit&&IsWindow(window)){
+        ExMessage m;
+        while(peekmessage(&m,EX_MOUSE|EX_KEY|EX_WINDOW,true)){
+            if(m.message==WM_CLOSE){quit=true;break;}
+            if(m.message==WM_KEYDOWN){if(m.vkcode==VK_ESCAPE){quit=true;break;}view.key(m.vkcode);}
+            else view.mouse(m);
+        }
+        view.poll();auto now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-last).count();last=now;
+        if(view.playing&&view.hasData()&&!view.current().trajectory.empty()){
+            view.time+=(std::min)(elapsed,.1)*view.speeds[view.speedIndex];
+            if(view.time>=view.current().trajectory.back().t){view.time=view.current().trajectory.back().t;view.playing=false;}}
+        if(!quit&&IsWindow(window))view.render();Sleep(16);
+    }
+    // A running calculation owns no UI handles. Joining it before destruction avoids a detached thread.
+    if(view.future.valid())view.future.wait();
+    if(view.studyFuture.valid())view.studyFuture.wait();
+    if(IsWindow(window)){EndBatchDraw();closegraph();}return 0;
+}
+
+// Optional development-only screenshot hook. No screenshot is written during normal use.
+inline int runViewerSnapshot(const wchar_t* filename,bool analysisMode=false){
+    HWND window=initgraph(ui::W,ui::H);SetWindowTextW(window,L"山区滚石模拟 — 预览");BeginBatchDraw();
+    ui::View view;view.batch=runBatch(view.config(),view.count,42);view.playing=false;
+    if(!view.batch.runs.empty()&&!view.current().trajectory.empty())view.time=view.current().trajectory.back().t*.65;
+    if(analysisMode){const std::string out=newResultPath("preview_parameters");
+        runParameterStudy(view.config(),view.count,42,out);view.study=ui::readStudy(view.config(),view.count,42,out);view.analysisMode=true;view.factorIndex=1;}
+    view.render();saveimage(filename);EndBatchDraw();closegraph();return 0;
+}
+} // namespace rock
+
+
+// Unicode command-line entry; no arguments opens the interactive canvas.
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    try {
+        if (argc <= 1) return rock::runViewer();
+        std::vector<std::string> arguments;
+        for (int i=0; i<argc; ++i) {
+            const int bytes=WideCharToMultiByte(CP_UTF8,0,argv[i],-1,nullptr,0,nullptr,nullptr);
+            if(bytes<=0) throw std::runtime_error("Invalid Unicode argument");
+            std::string a(static_cast<size_t>(bytes),'\0');
+            WideCharToMultiByte(CP_UTF8,0,argv[i],-1,&a[0],bytes,nullptr,nullptr);
+            a.pop_back(); arguments.push_back(std::move(a));
+        }
+        std::vector<char*> pointers;
+        for(auto& a:arguments) pointers.push_back(a.data());
+        return rock::runCommandLine(static_cast<int>(pointers.size()),pointers.data());
+    } catch(const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n';
+        return 2;
+    }
+}
