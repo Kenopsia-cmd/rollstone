@@ -18,8 +18,8 @@
 #pragma comment(lib,"gdi32.lib")
 #pragma comment(lib,"shell32.lib")
 #endif
-#define ROCK_STAGE 4
-#define ROCK_VERSION "v1.4.1"
+#define ROCK_STAGE 5
+#define ROCK_VERSION "v1.5.1"
 
 // ==================== model.hpp ====================
 
@@ -89,6 +89,7 @@ struct State {
     double barrierForce=0,contactImpulse=0; // spring/damper force N; cumulative barrier normal impulse N s
     bool barrierHit=false,barrierFailed=false;
     bool barrierPassed=false,barrierOvertopped=false,barrierIntercepted=false;
+    uint64_t integrationSteps=0; // actual legacy steps or adaptive collision substeps
     std::string stopReason;
 };
 struct Sample {
@@ -242,8 +243,15 @@ inline void impulse(State& s,Vec2 arm,Vec2 normal,double magnitude){
 inline double effectiveInverseMass(const State& s,Vec2 arm,Vec2 direction){
     double lever=cross(arm,direction);return 1/s.mass+lever*lever/s.inertia;
 }
+inline double simulationDomainRight(const Config& c){
+    double right=std::max(c.terrain.toeX()+80.,c.detectorX+30.);
+    if(c.barrier.kind!=BarrierKind::None)right=std::max(right,c.barrier.x+
+        (c.barrier.kind==BarrierKind::Elastic?c.barrier.maxDeflection:0)+2*c.radius+30.);
+    return right;
+}
 inline void stepSphereLegacy(State& s,const Config& c){
     if(!s.moving)return;
+    ++s.integrationSteps;
     const double dt=c.dt;
     const Material& m=c.terrain.surfaces.empty()?c.material:c.terrain.surfaces[c.terrain.segment(s.p.x)];
     double kd=.5*1.225*m.drag*PI*c.radius*c.radius/s.mass;
@@ -430,6 +438,7 @@ inline double advancedStepLimit(const State& s,const Config& c){
     return h;
 }
 inline void advancedSubstep(State& s,const Config& c,double h){
+    if(++s.integrationSteps>5000000)throw std::runtime_error("One trajectory exceeded five million collision substeps; reduce its duration or stiffness");
     const State previous=s;
     const double previousEnergy=kineticEnergy(s)+s.mass*G*s.p.z+panelStored(s,c)+s.barrierDissipation;
     const double previousWall=c.barrier.x+(c.barrier.kind==BarrierKind::Elastic?s.barrierDeflection:0);
@@ -449,14 +458,15 @@ inline void advancedSubstep(State& s,const Config& c,double h){
         const double dw=material.rollResistance*s.mass*G*normal.z*c.radius*h/s.inertia;
         s.omega=std::copysign(std::max(0.,std::abs(s.omega)-dw),s.omega);
     }
-    barrierImpulse(s,c,h,approachSide);finishPanel(s,c);
+    barrierImpulse(s,c,h,approachSide);
     // Passive energy guard for discretization/projection error. Initial overlaps are
     // invalid starting states; the normal initialized configurations have no overlap.
     const double panelK=c.barrier.kind==BarrierKind::Elastic&&!s.barrierFailed?.5*c.barrier.mass*s.barrierVelocity*s.barrierVelocity:0;
     const double currentK=kineticEnergy(s)+panelK;
     const double fixedEnergy=s.mass*G*s.p.z+panelStored(s,c)-panelK+s.barrierDissipation;
     const double allowed=std::max(0.,previousEnergy-fixedEnergy);
-    if(currentK>allowed+1e-8&&currentK>0){const double f=std::sqrt(allowed/currentK);s.v=s.v*f;s.omega*=f;s.barrierVelocity*=f;finishPanel(s,c);}
+    if(currentK>allowed+1e-8&&currentK>0){const double f=std::sqrt(allowed/currentK);s.v=s.v*f;s.omega*=f;s.barrierVelocity*=f;}
+    finishPanel(s,c);
     if(c.barrier.kind!=BarrierKind::None){
         const double wall=c.barrier.x+(c.barrier.kind==BarrierKind::Elastic&&!s.barrierFailed?s.barrierDeflection:0);
         const double left=s.p.x-supportRadius(c,s.angle,{1,0});
@@ -475,21 +485,22 @@ inline void advancedSubstep(State& s,const Config& c,double h){
             if(!barrierContacts(near,c,approachSide).empty()){s.barrierIntercepted=true;s.stopReason="intercepted";}
         }
     }
-    if(s.p.x<c.terrain.points.front().x-20||s.p.x>std::max(c.terrain.toeX()+80.,c.detectorX+30.)){s.moving=false;s.stopReason="domain_exit";}
+    if(s.p.x<c.terrain.points.front().x-20||s.p.x>simulationDomainRight(c)){s.moving=false;s.stopReason="domain_exit";}
     if(!std::isfinite(s.p.x)||!std::isfinite(s.p.z)||!std::isfinite(s.v.x)||!std::isfinite(s.v.z)||!std::isfinite(s.omega)||!std::isfinite(s.barrierDeflection))
         throw std::runtime_error("Nonfinite extended physics state");
 }
 } // namespace detail
-inline void step(State& s,const Config& c){
+template<class Observer> inline void stepObserved(State& s,const Config& c,Observer&& observe){
     if(!s.moving)return;
-    if(c.shape==Shape::Sphere&&c.barrier.kind==BarrierKind::None){stepSphereLegacy(s,c);return;}
+    if(c.shape==Shape::Sphere&&c.barrier.kind==BarrierKind::None){const State previous=s;stepSphereLegacy(s,c);observe(previous,s);return;}
     double remaining=c.dt;int substeps=0;
     while(remaining>1e-12&&s.moving){
         const double h=std::min(remaining,detail::advancedStepLimit(s,c));
         if(++substeps>20000||h<1e-10)throw std::runtime_error("Extended collision substep limit exceeded");
-        detail::advancedSubstep(s,c,h);remaining-=h;
+        const State previous=s;detail::advancedSubstep(s,c,h);observe(previous,s);remaining-=h;
     }
 }
+inline void step(State& s,const Config& c){stepObserved(s,c,[](const State&,const State&){});}
 inline Sample sample(const State& s){
     Sample p{s.time,s.p.x,s.p.z,s.v.x,s.v.z,s.angle,s.omega,kineticEnergy(s),s.barrierDeflection};
     p.barrierHit=s.barrierHit;p.barrierFailed=s.barrierFailed;p.barrierVelocity=s.barrierVelocity;
@@ -502,7 +513,7 @@ inline RunResult simulate(const Config& c){
     result.runoutX=s.p.x;result.maxSpeed=length(s.v);result.maxEnergy=kineticEnergy(s);
     const int steps=static_cast<int>(std::ceil(c.maxTime/c.dt));
     for(int i=0;i<steps&&s.moving;++i){
-        State previous=s;step(s,c);
+        stepObserved(s,c,[&](const State& previous,const State&){
         result.runoutX=std::max(result.runoutX,s.p.x);
         result.maxSpeed=std::max(result.maxSpeed,length(s.v));
         result.maxEnergy=std::max(result.maxEnergy,kineticEnergy(s));
@@ -514,10 +525,12 @@ inline RunResult simulate(const Config& c){
             double crossingOmega=previous.omega+(s.omega-previous.omega)*f;
             result.detectorSpeed=length(crossingVelocity);
             result.detectorEnergy=.5*s.mass*dot(crossingVelocity,crossingVelocity)+.5*s.inertia*crossingOmega*crossingOmega;
-            result.detectorTime=previous.time+c.dt*f;
+            const double crossingStep=c.shape==Shape::Sphere&&c.barrier.kind==BarrierKind::None?c.dt:s.time-previous.time;
+            result.detectorTime=previous.time+crossingStep*f;
             result.inBand=result.detectorHeight>=0&&result.detectorHeight<=10;
         }
         if(s.time+1e-9>=nextSample){result.trajectory.push_back(sample(s));nextSample+=c.sampleInterval;}
+        });
     }
     if(result.trajectory.back().t<s.time-1e-9)result.trajectory.push_back(sample(s));
     if(s.moving){s.stopReason="time_limit";s.moving=false;}
@@ -559,19 +572,25 @@ inline Config randomize(const Config& base,std::mt19937& rng) {
     }
     return c;
 }
+inline double nominalIntegrationStep(const Config& c){
+    return c.shape==Shape::Sphere&&c.barrier.kind==BarrierKind::None?c.dt:std::min(c.dt,.0005);
+}
 inline BatchResult runBatch(const Config& base,int count,uint32_t seed) {
     validate(base);
     if(count<1 || count>5000)throw std::invalid_argument("runs must be in [1,5000]");
-    if(count*std::ceil(base.maxTime/base.dt)>2e8)
+    if(count*std::ceil(base.maxTime/nominalIntegrationStep(base))>2e8)
         throw std::invalid_argument("Requested integration work exceeds 200 million steps; reduce runs or time horizon");
     if(count*base.maxTime/base.sampleInterval>4e6)
         throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase --sample-interval");
     BatchResult b;b.base=base;b.seed=seed;
     b.heightCounts.assign(static_cast<size_t>(std::ceil(10/base.binHeight)),0);
+    uint64_t actualSteps=0;
     for(int i=0;i<count;++i){
         std::seed_seq trialSeed{seed,static_cast<uint32_t>(i)};
         std::mt19937 rng(trialSeed);
         auto r=simulate(randomize(base,rng));
+        actualSteps+=r.finalState.integrationSteps;
+        if(actualSteps>200000000ULL)throw std::runtime_error("Actual collision work exceeded 200 million substeps; reduce runs");
         if(r.reached){
             ++b.reached;
             if(r.inBand){++b.inBand;const size_t k=std::min(b.heightCounts.size()-1,
@@ -584,7 +603,7 @@ inline BatchResult runBatch(const Config& base,int count,uint32_t seed) {
         // so fast motion cannot skip a cell merely because output sampling is sparse.
         auto mark=[&](double x,double z){
             const double h=z-base.terrain.toeZ();
-            if(h<0 || h>10 || x<base.terrain.points.front().x || x>std::max(base.terrain.toeX()+80.,base.detectorX+30.))return;
+            if(h<0 || h>10 || x<base.terrain.points.front().x || x>simulationDomainRight(base))return;
             const int ix=static_cast<int>(std::floor(x/base.gridWidth));
             const int iz=std::min(static_cast<int>(b.heightCounts.size())-1,static_cast<int>(h/base.binHeight));
             visited.insert({ix,iz});
@@ -618,6 +637,15 @@ inline std::string batchSummary(const BatchResult& b){
     for(size_t i=0;i<b.heightCounts.size();++i)
         s<<i*b.base.binHeight<<".."<<std::min(10.,(i+1)*b.base.binHeight)<<" m: "
          <<b.heightCounts[i]<<" P="<<(n?double(b.heightCounts[i])/n:0)<<"\n";
+#if ROCK_STAGE >= 6
+    if(b.base.barrier.kind!=BarrierKind::None){
+        size_t hits=0,intercepted=0,failed=0,overtopped=0;
+        for(const auto& r:b.runs){hits+=r.finalState.barrierHit;intercepted+=r.finalState.barrierIntercepted;
+            failed+=r.finalState.barrierFailed;overtopped+=r.finalState.barrierOvertopped;}
+        s<<"barrier_hit="<<hits<<" stable_interception="<<intercepted<<" failed="<<failed<<" overtopped="<<overtopped<<'\n';
+        s<<"P(stable_interception)="<<(n?double(intercepted)/n:0)<<"; not_reached is not interception.\n";
+    }
+#endif
     return s.str();
 }
 }
@@ -656,6 +684,18 @@ inline std::ofstream csvFile(const std::filesystem::path& p){
 }
 inline const char* shapeName(Shape s){return s==Shape::Sphere?"sphere":"polygon";}
 inline const char* barrierName(BarrierKind k){return k==BarrierKind::None?"none":k==BarrierKind::Rigid?"rigid":"elastic";}
+#if ROCK_STAGE >= 6
+inline const char* barrierOutcome(const RunResult& r){
+    if(r.config.barrier.kind==BarrierKind::None)return "disabled";
+    const auto& s=r.finalState;
+    if(s.barrierIntercepted)return "intercepted";
+    if(s.barrierFailed&&s.barrierPassed)return "failed_passage";
+    if(s.barrierOvertopped&&s.barrierPassed)return "overtopped";
+    if(s.barrierFailed)return "failed_unresolved";
+    if(s.barrierHit)return "hit_unresolved";
+    return "not_encountered";
+}
+#endif
 inline void exportBatch(const BatchResult& b,const std::string& outputDir){
     namespace fs=std::filesystem;const auto out=pathFromUtf8(outputDir);
     if(fs::exists(out) && !fs::is_empty(out))throw std::runtime_error("Output folder must be new or empty: "+outputDir);
@@ -671,17 +711,45 @@ inline void exportBatch(const BatchResult& b,const std::string& outputDir){
     for(const auto& item:b.routeCells)grid<<item.first.first*c.gridWidth<<','<<(item.first.first+1)*c.gridWidth<<','
         <<item.first.second*c.binHeight<<','<<std::min(10.,(item.first.second+1)*c.binHeight)<<','<<item.second<<','<<n<<','<<double(item.second)/n<<'\n';
     auto runs=csvFile(out/"runs.csv");
-    runs<<"trial_id,seed,initial_speed_m_s,radius_m,roll_resistance,friction,restitution,drag,shape,sides,reached,in_0_10m,detector_height_m,detector_speed_m_s,detector_energy_J,detector_time_s,runout_x_m,max_speed_m_s,max_energy_J,max_bounce_height_m,duration_s,status,barrier_hit,barrier_failed,max_deflection_m,peak_force_N,dissipated_energy_J\n";
+    runs<<"trial_id,seed,initial_speed_m_s,radius_m,roll_resistance,friction,restitution,drag,shape,sides,reached,in_0_10m,detector_height_m,detector_speed_m_s,detector_energy_J,detector_time_s,runout_x_m,max_speed_m_s,max_energy_J,max_bounce_height_m,duration_s,status,barrier_hit,barrier_failed,max_deflection_m,peak_support_force_N,dissipated_energy_J";
+#if ROCK_STAGE >= 6
+    runs<<",barrier_contact_impulse_N_s,barrier_passed,barrier_overtopped,barrier_intercepted,barrier_outcome,integration_steps";
+#endif
+    runs<<'\n';
     auto trajectory=csvFile(out/"trajectories.csv");
-    trajectory<<"trial_id,t_s,x_m,z_m,height_above_toe_m,vx_m_s,vz_m_s,angle_rad,omega_rad_s,kinetic_energy_J,barrier_deflection_m\n";
+    trajectory<<"trial_id,t_s,x_m,z_m,height_above_toe_m,vx_m_s,vz_m_s,angle_rad,omega_rad_s,kinetic_energy_J,barrier_deflection_m";
+#if ROCK_STAGE >= 6
+    trajectory<<",barrier_hit,barrier_failed,barrier_velocity_m_s,barrier_support_force_N,barrier_dissipated_energy_J,barrier_contact_impulse_N_s";
+#endif
+#if ROCK_STAGE >= 8
+    trajectory<<",rock_potential_energy_J,rock_mechanical_energy_J,barrier_elastic_energy_J,barrier_kinetic_energy_J,system_energy_plus_dissipation_J";
+#endif
+    trajectory<<'\n';
     auto surfaces=csvFile(out/"sampled_surfaces.csv");
     surfaces<<"trial_id,segment_index,roll_resistance,friction,restitution,drag\n";
     for(size_t i=0;i<n;++i){const auto& r=b.runs[i];const auto& m=r.config.material;const auto& s=r.finalState;
         runs<<i+1<<','<<b.seed<<','<<r.config.initialSpeed<<','<<r.config.radius<<','<<m.rollResistance<<','<<m.friction<<','<<m.restitution<<','<<m.drag<<','<<shapeName(r.config.shape)<<','<<r.config.sides<<','<<r.reached<<','<<r.inBand<<',';
         if(r.reached)runs<<r.detectorHeight<<','<<r.detectorSpeed<<','<<r.detectorEnergy<<','<<r.detectorTime;
         else runs<<",,,";
-        runs<<','<<r.runoutX<<','<<r.maxSpeed<<','<<r.maxEnergy<<','<<r.maxBounceHeight<<','<<s.time<<','<<r.status<<','<<s.barrierHit<<','<<s.barrierFailed<<','<<s.maxBarrierDeflection<<','<<s.peakBarrierForce<<','<<s.barrierDissipation<<'\n';
-        for(const auto& t:r.trajectory)trajectory<<i+1<<','<<t.t<<','<<t.x<<','<<t.z<<','<<t.z-c.terrain.toeZ()<<','<<t.vx<<','<<t.vz<<','<<t.angle<<','<<t.omega<<','<<t.energy<<','<<t.deflection<<'\n';
+        runs<<','<<r.runoutX<<','<<r.maxSpeed<<','<<r.maxEnergy<<','<<r.maxBounceHeight<<','<<s.time<<','<<r.status<<','<<s.barrierHit<<','<<s.barrierFailed<<','<<s.maxBarrierDeflection<<','<<s.peakBarrierForce<<','<<s.barrierDissipation;
+#if ROCK_STAGE >= 6
+        runs<<','<<s.contactImpulse<<','<<s.barrierPassed<<','<<s.barrierOvertopped<<','<<s.barrierIntercepted<<','<<barrierOutcome(r)<<','<<s.integrationSteps;
+#endif
+        runs<<'\n';
+        for(const auto& t:r.trajectory){
+            trajectory<<i+1<<','<<t.t<<','<<t.x<<','<<t.z<<','<<t.z-c.terrain.toeZ()<<','<<t.vx<<','<<t.vz<<','<<t.angle<<','<<t.omega<<','<<t.energy<<','<<t.deflection;
+#if ROCK_STAGE >= 6
+            trajectory<<','<<t.barrierHit<<','<<t.barrierFailed<<','<<t.barrierVelocity<<','<<t.barrierForce<<','<<t.barrierDissipation<<','<<t.contactImpulse;
+#endif
+#if ROCK_STAGE >= 8
+            const double potential=s.mass*G*(t.z-c.terrain.toeZ());
+            const bool panel=r.config.barrier.kind==BarrierKind::Elastic&&!t.barrierFailed;
+            const double stored=panel?.5*r.config.barrier.stiffness*t.deflection*t.deflection:0.;
+            const double panelK=panel?.5*r.config.barrier.mass*t.barrierVelocity*t.barrierVelocity:0.;
+            trajectory<<','<<potential<<','<<t.energy+potential<<','<<stored<<','<<panelK<<','<<t.energy+potential+stored+panelK+t.barrierDissipation;
+#endif
+            trajectory<<'\n';
+        }
         for(size_t j=0;j+1<r.config.terrain.points.size();++j){
             const auto& sm=r.config.terrain.surfaces.empty()?m:r.config.terrain.surfaces[j];
             surfaces<<i+1<<','<<j<<','<<sm.rollResistance<<','<<sm.friction<<','<<sm.restitution<<','<<sm.drag<<'\n';
@@ -690,14 +758,14 @@ inline void exportBatch(const BatchResult& b,const std::string& outputDir){
     auto terrain=csvFile(out/"terrain.csv");terrain<<"point_index,x_m,z_m\n";
     for(size_t i=0;i<c.terrain.points.size();++i)terrain<<i<<','<<c.terrain.points[i].x<<','<<c.terrain.points[i].z<<'\n';
     auto metadata=csvFile(out/"config.csv");metadata<<"parameter,value\n"
-        <<"schema_version,1\nprogram_version,"<<ROCK_VERSION<<"\nseed,"<<b.seed<<"\nruns,"<<n<<"\ndt_s,"<<c.dt<<"\nmax_time_s,"<<c.maxTime
+        <<"schema_version,2\nprogram_version,"<<ROCK_VERSION<<"\nseed,"<<b.seed<<"\nruns,"<<n<<"\ndt_s,"<<c.dt<<"\nmax_time_s,"<<c.maxTime
         <<"\nsample_interval_s,"<<c.sampleInterval<<"\ncoefficient_of_variation,"<<c.cv<<"\nrandom_surface,"<<c.randomSurface
         <<"\nradius_m,"<<c.radius<<"\ninitial_speed_m_s,"<<c.initialSpeed<<"\ndensity_kg_m3,"<<c.density
         <<"\nroll_resistance,"<<c.material.rollResistance<<"\nfriction,"<<c.material.friction<<"\nrestitution,"<<c.material.restitution<<"\ndrag,"<<c.material.drag
         <<"\ndetector_x_m,"<<(c.detectorX<0?c.terrain.toeX():c.detectorX)<<"\ndetector_reference_z_m,"<<c.terrain.toeZ()
         <<"\nbin_height_m,"<<c.binHeight<<"\ngrid_width_m,"<<c.gridWidth<<"\nshape,"<<shapeName(c.shape)<<"\nsides,"<<c.sides<<"\nshape_phase_rad,"<<c.shapePhase
         <<"\nbarrier,"<<barrierName(c.barrier.kind)<<"\nbarrier_x_m,"<<c.barrier.x<<"\nbarrier_height_m,"<<c.barrier.height
-        <<"\nbarrier_restitution,"<<c.barrier.restitution<<"\nstiffness_N_m,"<<c.barrier.stiffness<<"\ndamping_N_s_m,"<<c.barrier.damping<<"\nmax_deflection_m,"<<c.barrier.maxDeflection
+        <<"\nbarrier_restitution,"<<c.barrier.restitution<<"\nstiffness_N_m,"<<c.barrier.stiffness<<"\ndamping_N_s_m,"<<c.barrier.damping<<"\nmax_deflection_m,"<<c.barrier.maxDeflection<<"\nbarrier_mass_kg,"<<c.barrier.mass
         <<"\nterrain_width_scale,"<<c.terrainWidthScale<<"\nterrain_height_scale,"<<c.terrainHeightScale<<'\n';
     auto summary=csvFile(out/"summary.txt");summary<<batchSummary(b);
     auto readme=csvFile(out/"READ_ME.txt");
@@ -711,7 +779,22 @@ inline void exportBatch(const BatchResult& b,const std::string& outputDir){
        <<"Zero-hit cells are omitted; seed reproducibility assumes the same executable/standard library.\n"
        <<"Gaussian sigma=abs(mean)*CV; physically invalid draws are rejected (truncated normal).\n"
        <<"Zero-mean variables stay zero. Stored mean/CV are parent-normal parameters, not post-truncation moments.\n"
+       <<"Polygon geometry is a regular convex lamina with circumscribed radius and equivalent sphere mass.\n"
+       <<"Extended collision dynamics use adaptive substeps; near-start/stop polygon paths may be timestep-sensitive.\n"
+       <<"peak_support_force_N is the elastic spring/damper reaction, not impulse divided by dt; rigid value is 0.\n"
+       <<"Barrier contact impulse is cumulative normal impulse (N s). Stable interception is distinct from not reaching the detector.\n"
+       <<"failed_unresolved and hit_unresolved are censored outcomes, not successful interception.\n"
+       <<"Energy is relative to toe elevation; passive contact correction and implicit integration can dissipate additional numerical energy.\n"
        <<"This is a 2-D educational model, not a calibrated engineering design or barrier certification tool.\n";
+#if ROCK_STAGE >= 6
+    auto outcomes=csvFile(out/"barrier_outcomes.csv");
+    outcomes<<"outcome,trial_count,total_trials,probability,wilson95_low,wilson95_high\n";
+    std::map<std::string,size_t> counts;
+    for(const char* key:{"disabled","intercepted","failed_passage","overtopped","failed_unresolved","hit_unresolved","not_encountered"})counts[key]=0;
+    for(const auto& r:b.runs)++counts[barrierOutcome(r)];
+    for(const auto& item:counts){const auto ci=wilson(item.second,n);outcomes<<item.first<<','<<item.second<<','<<n<<','<<double(item.second)/n<<','<<ci.first<<','<<ci.second<<'\n';}
+    outcomes.flush();if(!outcomes)throw std::runtime_error("Failed to write barrier outcomes");
+#endif
     for(auto* f:{&bins,&grid,&runs,&trajectory,&surfaces,&terrain,&metadata,&summary,&readme}){
         f->flush();if(!*f)throw std::runtime_error("CSV output failed (disk full or I/O error)");
     }
@@ -826,7 +909,7 @@ inline void writeConfig(const Config& c,int n,uint32_t seed,const std::filesyste
        <<"\nbarrier_kind="<<int(c.barrier.kind)<<"\nbarrier_x_m="<<c.barrier.x
        <<"\nbarrier_height_m="<<c.barrier.height<<"\nbarrier_restitution="<<c.barrier.restitution
        <<"\nbarrier_stiffness_N_m="<<c.barrier.stiffness<<"\nbarrier_damping_N_s_m="<<c.barrier.damping
-       <<"\nbarrier_max_deflection_m="<<c.barrier.maxDeflection<<"\n";
+       <<"\nbarrier_max_deflection_m="<<c.barrier.maxDeflection<<"\nbarrier_mass_kg="<<c.barrier.mass<<"\n";
     auto terrain=open(dir/"terrain.csv");terrain<<"point_index,x_m,z_m,outgoing_roll_resistance,outgoing_friction,outgoing_restitution,outgoing_drag\n";
     for(size_t i=0;i<c.terrain.points.size();++i){
         const auto&p=c.terrain.points[i];terrain<<i<<','<<p.x<<','<<p.z;
@@ -923,7 +1006,7 @@ inline int runParameterStudy(const Config& input,int count,uint32_t seed,const s
     }
     if(count*base.maxTime/base.sampleInterval>4e6)
         throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase sample interval");
-    if(count*std::ceil(base.maxTime/base.dt)>2e8)
+    if(count*std::ceil(base.maxTime/nominalIntegrationStep(base))>2e8)
         throw std::invalid_argument("Too many integration steps; reduce runs or simulation duration");
     const std::filesystem::path root=pathFromUtf8(outputDir);
     if(std::filesystem::exists(root)&&(!std::filesystem::is_directory(root)||!std::filesystem::is_empty(root)))
@@ -1002,7 +1085,7 @@ inline int runTerrainStudy(const Config& input,int count,uint32_t seed,const std
     for(const auto& scenario:scenarios)validate(scenario.config);
     if(count*base.maxTime/base.sampleInterval>4e6)
         throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase sample interval");
-    if(count*std::ceil(base.maxTime/base.dt)>2e8)
+    if(count*std::ceil(base.maxTime/nominalIntegrationStep(base))>2e8)
         throw std::invalid_argument("Too many integration steps; reduce runs or simulation duration");
     const std::filesystem::path root=pathFromUtf8(outputDir);
     if(std::filesystem::exists(root)&&(!std::filesystem::is_directory(root)||!std::filesystem::is_empty(root)))
@@ -1311,6 +1394,7 @@ struct View {
     int count=200,page=0,chosenRow=0,trial=0,speedIndex=0,factorIndex=0;
     uint32_t seed=42;
     bool playing=true,dirty=false,studyDirty=false,analysisMode=false,terrainMode=false,terrainDirty=false,heat=false,overlay=true,scrubbing=false;
+    bool energyMode=false,multiReplay=false;
     int terrainFactor=0;
     double time=0;
     int materialPreset=1;
@@ -1327,12 +1411,24 @@ struct View {
     const double speeds[5]={.25,.5,1,2,4};
     View(){pending.randomSurface=true; speedIndex=2;}
     bool busy()const{return future.valid()||studyFuture.valid()||terrainFuture.valid();}
-    void setView(int mode){analysisMode=mode==1;terrainMode=mode==2;}
-    int activeView()const{return terrainMode?2:analysisMode?1:0;}
+    void setView(int mode){analysisMode=mode==1;terrainMode=mode==2;energyMode=mode==3;}
+    int activeView()const{return energyMode?3:terrainMode?2:analysisMode?1:0;}
+    static constexpr int viewCount(){return ROCK_STAGE>=8?4:3;}
     static constexpr int pageCount(){return ROCK_STAGE>=6?5:ROCK_STAGE>=5?4:3;}
     bool hasData()const{return !batch.runs.empty();}
     const RunResult& current()const{return batch.runs[static_cast<size_t>(trial)];}
     const Config& shown()const{return hasData()?batch.base:pending;}
+    int replayCount()const{
+#if ROCK_STAGE >= 8
+        if(multiReplay)return (std::min)(20,static_cast<int>(batch.runs.size()));
+#endif
+        return hasData()?1:0;
+    }
+    double replayEnd()const{
+        double end=0;for(int i=0;i<replayCount();++i){const auto& samples=batch.runs[(static_cast<size_t>(trial)+i)%batch.runs.size()].trajectory;
+            if(!samples.empty())end=(std::max)(end,samples.back().t);}return end;
+    }
+    void toggleMulti(){multiReplay=!multiReplay;time=0;playing=true;setView(0);}
     Config config()const{
         Config c=pending;
 #if ROCK_STAGE >= 4
@@ -1480,7 +1576,7 @@ struct View {
         if(result.trajectory.empty())return {};
         const auto& a=result.trajectory;
         auto it=std::lower_bound(a.begin(),a.end(),at,[](const Sample& p,double t){return p.t<t;});
-        if(it==a.begin())return *it;if(it==a.end())return a.back();
+        if(it==a.begin())return *it;if(it==a.end())return a.back();if(it->t==at)return *it;
         const auto& p=*(it-1);const auto& q=*it;double f=(at-p.t)/(q.t-p.t);
         Sample r=p;double* dst[]={&r.x,&r.z,&r.vx,&r.vz,&r.angle,&r.omega,&r.energy,&r.deflection};
         const double pv[]={p.x,p.z,p.vx,p.vz,p.angle,p.omega,p.energy,p.deflection};
@@ -1540,7 +1636,7 @@ struct View {
         }
         if(p.barrierFailed){const int middle=(base+top)/2;lineAt(moved,base,moved,middle+7,color,5);lineAt(moved+5,middle-7,moved+5,top,color,5);}
         else lineAt(moved,base,moved,top,color,5);
-        text(moved-35,top-25,p.barrierFailed?L"已失效":elastic?L"弹性拦挡":L"刚性拦挡",13,color);
+        text(moved+12,top+8,p.barrierFailed?L"已失效":elastic?L"弹性拦挡":L"刚性拦挡",13,color);
         if(elastic)text(plot.l+12,plot.t+11,L"当前挠度 "+num(p.deflection,3)+L" m  /  容量 "+num(barrier.maxDeflection,2)+L" m",13,color);
 #else
         (void)c;(void)p;
@@ -1575,6 +1671,14 @@ struct View {
         if(hasData()){
             const auto p=sample();path(current(),ORANGE,time,2);
             const auto& rc=current().config;
+#if ROCK_STAGE >= 8
+            if(multiReplay){for(int i=replayCount()-1;i>0;--i){const auto& run=batch.runs[(static_cast<size_t>(trial)+i)%batch.runs.size()];
+                    const COLORREF color=RGB(90+(i*43)%145,120+(i*29)%115,120+(i*71)%115);
+                    drawBody(run.config,sampleAt(run,time),color);}
+                text(plot.l+12,plot.t+38,L"同步回放 "+num(replayCount(),0)+L" / "+num(static_cast<double>(batch.runs.size()),0)+L" 条独立试验（不含颗粒间碰撞）",13,ACCENT);
+                if(rc.barrier.kind!=BarrierKind::None)text(plot.l+12,plot.t+62,L"拦挡状态对应白色高亮试验；各试验相互独立",12,MUTED);
+            }
+#endif
             drawBody(rc,p,RGB(224,229,233));drawBarrier(rc,p);
         }
         text(plot.r-151,plot.t+9,L"水平距离 x / m",13,MUTED);
@@ -1597,7 +1701,7 @@ struct View {
         text(27,660,L"↑↓ 选参数   ←→ 调整   Tab 切页",14,MUTED);
         text(27,685,L"PageUp / PageDown 选择试验",14,MUTED);
         text(27,710,L"空格 暂停   J / L 前后定位",14,MUTED);
-        text(27,738,L"批量按 CV 抽样；单次使用均值",14,MUTED);
+        text(27,738,ROCK_STAGE>=8?L"M 多颗同步   F 能量曲线":L"批量按 CV 抽样；单次使用均值",14,MUTED);
         text(27,763,L"V 切换视图   O 输出目录",14,MUTED);
         text(27,784,L"画布、CSV、研究使用同一计算核心",12,ACCENT);
         if(page==2){text(29,398,L"蓝线：坡脚石心高度 0–10 m",14,SKYBLUE);
@@ -1748,9 +1852,49 @@ struct View {
         text(385,751,L"正态抽样，越界重采样；CV = 标准差 / 均值。完整数据及配对效应已写入 CSV。",13,MUTED);
         text(385,775,L"点击上方五个参数切换对照图；V 返回批量轨迹。",13,ACCENT);
     }
+    void renderEnergy(){
+#if ROCK_STAGE >= 8
+        box({370,138,1266,798},RGB(17,30,46));text(385,151,L"当前试验的能量随时间变化",20);
+        if(!hasData()||current().trajectory.empty()){text(405,290,L"先运行 B 生成轨迹，再查看能量曲线。",20,MUTED);return;}
+        const auto& run=current();const auto& samples=run.trajectory;const double mass=run.finalState.mass,toe=run.config.terrain.toeZ();
+        const Rect graph{425,220,1238,496};const double end=(std::max)(.001,samples.back().t);
+        double lower=0,upper=1;
+        for(const auto& point:samples){const double potential=mass*G*(point.z-toe)/1e6,total=point.energy/1e6+potential;
+            lower=(std::min)(lower,potential);upper=(std::max)(upper,(std::max)(point.energy/1e6,total));}
+        upper*=1.08;lower=lower<0?lower*1.08:0;
+        auto xx=[&](double t){return graph.l+static_cast<int>(t/end*(graph.r-graph.l));};
+        auto yy=[&](double e){return graph.b-static_cast<int>((e-lower)/(upper-lower)*(graph.b-graph.t));};
+        for(int i=0;i<=5;++i){const double t=end*i/5.,e=lower+(upper-lower)*i/5.;
+            lineAt(xx(t),graph.t,xx(t),graph.b,RGB(40,56,74));text(xx(t)-12,graph.b+6,num(t,1),11,MUTED);
+            lineAt(graph.l,yy(e),graph.r,yy(e),RGB(40,56,74));text(375,yy(e)-7,num(e,1),11,MUTED);}
+        const COLORREF colors[]={SKYBLUE,ORANGE,ACCENT};const wchar_t* names[]={L"动能",L"重力势能",L"滚石机械能"};
+        for(int type=0;type<3;++type){text(600+type*180,180,names[type],14,colors[type]);
+            for(size_t i=1;i<samples.size();++i){auto energy=[&](const Sample& p){double potential=mass*G*(p.z-toe)/1e6;return type==0?p.energy/1e6:type==1?potential:p.energy/1e6+potential;};
+                lineAt(xx(samples[i-1].t),yy(energy(samples[i-1])),xx(samples[i].t),yy(energy(samples[i])),colors[type],2);}}
+        text(385,191,L"能量 / MJ",13,MUTED);text(1184,516,L"时间 / s",12,MUTED);
+        const double at=(std::min)(time,end);lineAt(xx(at),graph.t,xx(at),graph.b,INK,1);
+        const auto p=sample();const double kinetic=p.energy/1e6,potential=mass*G*(p.z-toe)/1e6;
+        text(385,539,L"试验 "+num(trial+1,0)+L"   t="+num(at)+L" s   速度 "+num(std::hypot(p.vx,p.vz),2)+L" m/s   结局："+stopName(run),15);
+        box(timeline,RGB(36,55,74));const double playbackEnd=replayEnd();const int cursor=timeline.l+static_cast<int>((timeline.r-timeline.l)*(playbackEnd>0?time/playbackEnd:0));
+        box({timeline.l,timeline.t,cursor,timeline.b},RGB(38,117,113));setfillcolor(ACCENT);solidcircle(cursor,(timeline.t+timeline.b)/2,7);
+        text(385,598,L"拖动时间轴定位；PageUp / PageDown 选择试验。所有值取自同一条 CSV 轨迹。",13,MUTED);
+        box({382,628,1253,786},PANEL);
+        text(400,643,L"当前动能 "+num(kinetic,3)+L" MJ",18,SKYBLUE);text(680,643,L"当前势能 "+num(potential,3)+L" MJ",18,ORANGE);
+        text(961,643,L"机械能 "+num(kinetic+potential,3)+L" MJ",18,ACCENT);
+        text(400,681,L"势能以坡脚高程为零点；机械能 = 平动与转动动能 + 重力势能。",14,MUTED);
+        if(run.config.barrier.kind==BarrierKind::Elastic){const auto& b=run.config.barrier;
+            const double stored=p.barrierFailed?0:(.5*b.stiffness*p.deflection*p.deflection+.5*b.mass*p.barrierVelocity*p.barrierVelocity)/1e6;
+            text(400,715,L"弹性板储能 "+num(stored,3)+L" MJ    拦挡耗散 "+num(p.barrierDissipation/1e6,3)+L" MJ    当前力 "+num(p.barrierForce/1000.,1)+L" kN",14);
+        }else text(400,715,L"接触碰撞、摩擦与空气阻力会耗能；曲线显示计算结果，不假设机械能恒定。",14,MUTED);
+        text(400,751,L"F 进入能量视图；M 返回多颗同步回放；V 切换全部视图。",14,ACCENT);
+#endif
+    }
     void render(){
         setbkcolor(BG);cleardevice();
         text(24,20,L"山区滚石 · 随机试验",29);text(26,60,L"路线概率 / CSV 导出 / 参数研究 / 地形研究",15,MUTED);
+#if ROCK_STAGE >= 8
+        button({757,58,911,89},L"多颗同步 M",multiReplay);button({921,58,1071,89},L"能量曲线 F",energyMode);
+#endif
         if(busy()){
             double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-jobStart).count();
             text(650,28,(terrainFuture.valid()?L"地形分析中… ":studyFuture.valid()?L"参数分析中… ":L"批量计算中… ")+num(elapsed,1)+L" s",19,ORANGE);
@@ -1762,11 +1906,12 @@ struct View {
         button({484,94,579,128},L"重播 R");button({587,94,696,128},L"轨迹叠加 T",overlay);
         button({704,94,815,128},L"热力图 H",heat);
         button({825,94,906,128},L"上一条");button({914,94,996,128},L"下一条");
-        button({1007,94,1088,128},L"轨迹",activeView()==0);button({1096,94,1177,128},L"参数",analysisMode);button({1185,94,1266,128},L"地形",terrainMode);
-        if(terrainMode)renderTerrain();else if(analysisMode)renderStudy();else{
+        const wchar_t* views[]={L"轨迹",L"参数",L"地形",L"能量"};const int viewWidth=259/viewCount();
+        for(int i=0;i<viewCount();++i)button({1007+i*viewWidth,94,1007+(i+1)*viewWidth-6,128},views[i],activeView()==i);
+        if(energyMode)renderEnergy();else if(terrainMode)renderTerrain();else if(analysisMode)renderStudy();else{
         renderScene();
         if(hasData()){
-            auto p=sample();const auto& a=current().trajectory;double end=a.empty()?0:a.back().t;
+            auto p=sample();const double end=replayEnd();
             text(376,539,L"试验 "+num(trial+1,0)+L"/"+num(static_cast<double>(batch.runs.size()),0)+L"   t="+num(time)+L"/"+num(end)+L" s   速度 "+num(std::hypot(p.vx,p.vz))+L" m/s   动能 "+num(p.energy/1000.,1)+L" kJ",15);
             box(timeline,RGB(36,55,74));int xx=timeline.l+static_cast<int>((timeline.r-timeline.l)*(end>0?time/end:0));box({timeline.l,timeline.t,xx,timeline.b},RGB(38,117,113));
             setfillcolor(ACCENT);solidcircle(xx,(timeline.t+timeline.b)/2,7);text(376,593,L"拖动时间轴逐帧查看；热力图为每条轨迹是否访问网格的概率。",12,MUTED);
@@ -1775,16 +1920,19 @@ struct View {
         text(24,818,note.substr(0,90),15,busy()?ORANGE:MUTED);
         FlushBatchDraw();
     }
-    void scrub(int x){if(!hasData()||current().trajectory.empty())return;double f=std::clamp(static_cast<double>(x-timeline.l)/(timeline.r-timeline.l),0.,1.);time=f*current().trajectory.back().t;playing=false;}
+    void scrub(int x){if(!hasData()||current().trajectory.empty())return;double f=std::clamp(static_cast<double>(x-timeline.l)/(timeline.r-timeline.l),0.,1.);time=f*replayEnd();playing=false;}
     void mouse(const ExMessage& m){
         if(m.message==WM_LBUTTONUP){scrubbing=false;return;}
         if(m.message==WM_MOUSEMOVE&&scrubbing){scrub(m.x);return;}
         if(m.message!=WM_LBUTTONDOWN)return;
         int x=m.x,y=m.y;
-        if(activeView()==0&&timeline.contains(x,y)){scrubbing=true;scrub(x);return;}
-        if(Rect{1007,94,1088,128}.contains(x,y)){setView(0);return;}
-        if(Rect{1096,94,1177,128}.contains(x,y)){setView(1);return;}
-        if(Rect{1185,94,1266,128}.contains(x,y)){setView(2);return;}
+        if((activeView()==0||energyMode)&&timeline.contains(x,y)){scrubbing=true;scrub(x);return;}
+        const int viewWidth=259/viewCount();
+        for(int i=0;i<viewCount();++i)if(Rect{1007+i*viewWidth,94,1007+(i+1)*viewWidth-6,128}.contains(x,y)){setView(i);return;}
+#if ROCK_STAGE >= 8
+        if(Rect{757,58,911,89}.contains(x,y)){toggleMulti();return;}
+        if(Rect{921,58,1071,89}.contains(x,y)){setView(3);return;}
+#endif
         if(analysisMode)for(int i=0;i<5;++i)if(Rect{380+i*175,149,548+i*175,184}.contains(x,y)){factorIndex=i;return;}
         if(terrainMode)for(int i=0;i<4;++i)if(Rect{380+i*220,149,590+i*220,184}.contains(x,y)){terrainFactor=i;return;}
         if(Rect{370,94,476,128}.contains(x,y)){playing=!playing;return;}
@@ -1806,7 +1954,10 @@ struct View {
         if(Rect{174,605,316,646}.contains(x,y))beginTerrain();
     }
     void key(int k){
-        if(k=='V'){setView((activeView()+1)%3);return;}
+        if(k=='V'){setView((activeView()+1)%viewCount());return;}
+#if ROCK_STAGE >= 8
+        if(k=='M'){toggleMulti();return;}if(k=='F'){setView(3);return;}
+#endif
         if(k=='O'){openOutput();return;}
         if(analysisMode&&k>='1'&&k<='5'){factorIndex=k-'1';return;}
         if(terrainMode&&k>='1'&&k<='4'){terrainFactor=k-'1';return;}
@@ -1814,7 +1965,7 @@ struct View {
         if(k=='R'){time=0;playing=true;return;}
         if(k=='T'){overlay=!overlay;return;}if(k=='H'){heat=!heat;return;}
         if(k==VK_PRIOR){selectTrial(-1);return;}if(k==VK_NEXT){selectTrial(1);return;}
-        if((k=='J'||k=='L')&&hasData()&&!current().trajectory.empty()){time=std::clamp(time+(k=='J'?-1.:1.),0.,current().trajectory.back().t);playing=false;return;}
+        if((k=='J'||k=='L')&&hasData()&&!current().trajectory.empty()){time=std::clamp(time+(k=='J'?-1.:1.),0.,replayEnd());playing=false;return;}
         if(busy())return;
         if(k==VK_RETURN)begin(false);else if(k=='B')begin(true);else if(k=='E')exportData();else if(k=='A')beginStudy();else if(k=='G')beginTerrain();
         else if(k==VK_TAB){page=(page+1)%pageCount();chosenRow=0;}
@@ -1838,7 +1989,7 @@ inline int runViewer(){
         view.poll();auto now=std::chrono::steady_clock::now();double elapsed=std::chrono::duration<double>(now-last).count();last=now;
         if(view.playing&&view.hasData()&&!view.current().trajectory.empty()){
             view.time+=(std::min)(elapsed,.1)*view.speeds[view.speedIndex];
-            if(view.time>=view.current().trajectory.back().t){view.time=view.current().trajectory.back().t;view.playing=false;}}
+            if(view.time>=view.replayEnd()){view.time=view.replayEnd();view.playing=false;}}
         if(!quit&&IsWindow(window))view.render();Sleep(16);
     }
     // A running calculation owns no UI handles. Joining it before destruction avoids a detached thread.
@@ -1863,6 +2014,10 @@ inline int runViewerSnapshotMode(const wchar_t* filename,int mode){
 #endif
     view.batch=runBatch(view.config(),view.count,42);view.playing=false;
     if(!view.batch.runs.empty()&&!view.current().trajectory.empty())view.time=view.current().trajectory.back().t*.65;
+#if ROCK_STAGE >= 8
+    if(mode==6){view.multiReplay=true;view.time=view.replayEnd()*.55;}
+    if(mode==7){view.setView(3);view.time=view.replayEnd()*.55;}
+#endif
 #if ROCK_STAGE >= 7
     if(mode==5&&!view.current().trajectory.empty()){
         const auto& samples=view.current().trajectory;
