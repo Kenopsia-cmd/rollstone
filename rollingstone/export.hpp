@@ -1,5 +1,6 @@
 #pragma once
 #include "model.hpp"
+#include "version.hpp"
 #include "batch.hpp"
 #include <filesystem>
 #include <fstream>
@@ -48,7 +49,7 @@ inline void exportBatch(const BatchResult& b,const std::string& outputDir){
     auto terrain=csvFile(out/"terrain.csv");terrain<<"point_index,x_m,z_m\n";
     for(size_t i=0;i<c.terrain.points.size();++i)terrain<<i<<','<<c.terrain.points[i].x<<','<<c.terrain.points[i].z<<'\n';
     auto metadata=csvFile(out/"config.csv");metadata<<"parameter,value\n"
-        <<"schema_version,1\nseed,"<<b.seed<<"\nruns,"<<n<<"\ndt_s,"<<c.dt<<"\nmax_time_s,"<<c.maxTime
+        <<"schema_version,1\nprogram_version,"<<ROCK_VERSION<<"\nseed,"<<b.seed<<"\nruns,"<<n<<"\ndt_s,"<<c.dt<<"\nmax_time_s,"<<c.maxTime
         <<"\nsample_interval_s,"<<c.sampleInterval<<"\ncoefficient_of_variation,"<<c.cv<<"\nrandom_surface,"<<c.randomSurface
         <<"\nradius_m,"<<c.radius<<"\ninitial_speed_m_s,"<<c.initialSpeed<<"\ndensity_kg_m3,"<<c.density
         <<"\nroll_resistance,"<<c.material.rollResistance<<"\nfriction,"<<c.material.friction<<"\nrestitution,"<<c.material.restitution<<"\ndrag,"<<c.material.drag

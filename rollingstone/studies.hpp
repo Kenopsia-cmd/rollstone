@@ -1,10 +1,12 @@
 #pragma once
+#include "version.hpp"
 #include "model.hpp"
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <locale>
 #include <sstream>
 
 namespace rock {
@@ -37,8 +39,9 @@ inline std::pair<double,double> interval(const Moments& m,bool probability){
 inline void number(std::ostream& out,double x){if(std::isfinite(x))out<<std::setprecision(12)<<x;}
 inline std::ofstream open(const std::filesystem::path& path){
     std::ofstream out(path,std::ios::binary);
-    if(!out)throw std::runtime_error("Cannot write study file: "+path.string());
+    if(!out)throw std::runtime_error("Cannot write study file: "+path.u8string());
     out.exceptions(std::ios::badbit|std::ios::failbit);
+    out.imbue(std::locale::classic());
     out<<std::setprecision(12);return out;
 }
 struct Metric {
@@ -85,7 +88,7 @@ inline size_t censored(const BatchResult& b){size_t n=0;for(const auto&r:b.runs)
 inline void writeConfig(const Config& c,int n,uint32_t seed,const std::filesystem::path& dir){
     std::filesystem::create_directories(dir);
     auto out=open(dir/"config.txt");
-    out<<"runs="<<n<<"\nseed="<<seed<<"\ncv="<<c.cv<<"\nrandom_surface="<<c.randomSurface
+    out<<"program_version="<<ROCK_VERSION<<"\nruns="<<n<<"\nseed="<<seed<<"\ncv="<<c.cv<<"\nrandom_surface="<<c.randomSurface
        <<"\ninitial_speed_m_s="<<c.initialSpeed<<"\nradius_m="<<c.radius<<"\ndensity_kg_m3="<<c.density
        <<"\ndt_s="<<c.dt<<"\nmax_time_s="<<c.maxTime<<"\nsample_interval_s="<<c.sampleInterval
        <<"\ncollector_x_m="<<(c.detectorX<0?c.terrain.toeX():c.detectorX)
@@ -139,48 +142,45 @@ inline void summaryRows(std::ostream& out,const std::string& factor,const std::s
     }
 }
 inline void describeEffects(std::ostream& out,const std::string& name,const BatchResult& b,const BatchResult& baseline){
-    out<<"\nScenario: "<<name<<" (censored runs="<<censored(b)<<"/"<<b.runs.size()<<")\n";
+    out<<"\n场景："<<name<<"（到达时间或计算域边界的试验："<<censored(b)<<"/"<<b.runs.size()<<"）\n";
     for(const auto&m:metrics()){
         if(m.conditional)continue;
-        if(m.name!="height_0_10m_probability"&&m.name!="collector_energy_all_runs_J"&&m.name!="runout_x_m")continue;
+        if(m.name!="height_0_10m_probability"&&m.name!="collector_speed_all_runs_m_s"&&
+           m.name!="collector_energy_all_runs_J"&&m.name!="max_speed_m_s"&&m.name!="runout_x_m")continue;
         const auto s=aggregate(b,m),e=paired(b,baseline,m);const auto ci=effectInterval(b,baseline,m);
-        out<<"  "<<m.name<<": mean=";number(out,s.value());out<<", difference from baseline=";number(out,e.value());
-        out<<", paired 95% CI=[";number(out,ci.first);out<<", ";number(out,ci.second);out<<"]. ";
-        if(m.name=="runout_x_m"&&(censored(b)||censored(baseline)))out<<"CENSORED trajectory extent: do not infer final runout ordering.";
-        else if(!std::isfinite(ci.first))out<<"Too few samples to estimate uncertainty.";
-        else if(ci.first>0)out<<"Higher in this experiment.";
-        else if(ci.second<0)out<<"Lower in this experiment.";
-        else out<<"Direction is not resolved by this interval.";
+        out<<"  "<<m.name<<"：均值=";number(out,s.value());out<<"，相对基准差=";number(out,e.value());
+        out<<"，配对差的95%区间=[";number(out,ci.first);out<<", ";number(out,ci.second);out<<"]。";
+        if(m.name=="runout_x_m"&&(censored(b)||censored(baseline)))out<<"轨迹范围被截断，不能据此判断最终停积距离的增减。";
+        else if(!std::isfinite(ci.first))out<<"有效样本不足，无法估计不确定度。";
+        else if(ci.first>0)out<<"本次试验中该指标更高。";
+        else if(ci.second<0)out<<"本次试验中该指标更低。";
+        else out<<"区间包含零，本次样本尚不能确定增减方向。";
+        const auto reference=aggregate(baseline,m);
+        if(!m.probability&&std::isfinite(reference.value())&&std::abs(reference.value())>1e-12&&
+           std::isfinite(e.value())&&std::abs(e.value())/std::abs(reference.value())<.001&&
+           (ci.first>0||ci.second<0)&&!(m.name=="runout_x_m"&&(censored(b)||censored(baseline))))
+            out<<"变化幅度小于基准的0.1%，需做步长收敛复核，暂不据此概括物理规律。";
         out<<'\n';
     }
 }
 inline void commonNotes(std::ostream& out){
-    out<<"All probabilities use all requested runs as denominator; missing the collector is not discarded.\n"
-       <<"Collector measurements refer to the FIRST forward crossing by the stone center.\n"
-       <<"all_runs collector speed/energy assign zero to non-arrivals; they are exposure metrics.\n"
-       <<"given_reached metrics condition on arrival, have their own valid_samples count, and no paired effect estimate.\n"
-       <<"Probability intervals: Wilson 95%; probability-difference intervals: conservative paired-discordance Wilson/Bonferroni 95%.\n"
-       <<"Other mean/effect intervals: approximate Student-t 95%.\n"
-       <<"Mean/effect intervals assume independent runs; they quantify Monte Carlo sampling error, NOT model error.\n"
-       <<"Every scenario uses the same seed and number of runs for common-random-number comparisons.\n"
-       <<"Normal inputs have target sigma=CV*mean; nonphysical draws are rejected. Bounded distributions have altered realized moments.\n"
-       <<"Only the named scenario factor is changed; other input means remain at their base values.\n"
-       <<"Finite max_time may censor runout. Inspect run_metrics.csv status and duration before interpreting results.\n"
-       <<"Exploratory multiple comparisons are not corrected; do not treat every 95% interval as a confirmatory test.\n"
-       <<"These are educational-model outputs, not validated design values for protective structures.\n";
+    out<<"参数对应：initial_speed=初速度，roll_resistance=滚动阻力，friction=摩擦系数，restitution=恢复系数，drag=空气阻力系数。\n"
+       <<"概率分母始终为全部试验数，未到达断面的试验没有被剔除。断面指标取石心首次向右通过时的数值。\n"
+       <<"all_runs 的断面速度/能量对未到达试验计零，是综合暴露指标，不是条件到达速度。\n"
+       <<"given_reached 指标仅统计已到达试验，valid_samples 为对应有效样本数；不提供不同条件样本之间的配对效应。\n"
+       <<"概率区间使用 Wilson 95%；概率差使用配对不一致事件的 Wilson/Bonferroni 保守95%区间。\n"
+       <<"其他均值及配对差使用近似 Student-t 95%区间；区间衡量蒙特卡洛抽样误差，不包含模型误差。\n"
+       <<"各场景使用相同种子和试验数，以共同随机数进行配对比较。仅改变指定参数的均值，其余参数均值不变。\n"
+       <<"正态抽样目标标准差=CV×均值；非物理值重采样。截断后实际均值和变异系数可能偏离目标。\n"
+       <<"domain_exit/time_limit 表示轨迹被计算域或最长时长截断；runout_x_m 为已观测最远位置，不必然是真实停止位置。\n"
+       <<"本分析为探索性多重比较，未进行整体多重检验校正，不能把每个95%区间都当作独立的确认性结论。\n"
+       <<"这些结果仅来自教学近似模型，未经现场数据标定，不是工程防护设计依据。\n";
 }
 }
 
 inline int runParameterStudy(const Config& input,int count,uint32_t seed,const std::string& outputDir){
-    if(count<2)throw std::invalid_argument("Studies require at least 2 runs per scenario");
+    if(count<2||count>5000)throw std::invalid_argument("Studies require 2 to 5000 runs per scenario");
     Config base=input;base.randomSurface=true;validate(base);
-    const std::filesystem::path root=std::filesystem::u8path(outputDir);
-    std::filesystem::create_directories(root);
-    auto csv=study::open(root/"parameter_study.csv");study::summaryHeader(csv);
-    auto report=study::open(root/"parameter_findings.txt");
-    report<<"PARAMETER STUDY: one mean at a time, levels 0.8 / 1.0 / 1.2\n";study::commonNotes(report);
-    study::writeConfig(base,count,seed,root/"baseline");
-    auto baseline=runBatch(base,count,seed);study::writeRunMetrics(baseline,root/"baseline");study::stripTrajectories(baseline);
     struct Factor{std::string name;std::function<void(Config&,double)> scale;};
     const std::vector<Factor> factors={
         {"initial_speed",[](Config&c,double f){c.initialSpeed*=f;}},
@@ -189,6 +189,24 @@ inline int runParameterStudy(const Config& input,int count,uint32_t seed,const s
         {"restitution",[](Config&c,double f){c.material.restitution*=f;for(auto&m:c.terrain.surfaces)m.restitution*=f;}},
         {"drag",[](Config&c,double f){c.material.drag*=f;for(auto&m:c.terrain.surfaces)m.drag*=f;}}
     };
+    // Validate every requested mean before creating files: an invalid 1.2x
+    // scenario must not leave a report that looks like a completed study.
+    for(const auto& factor:factors)for(int percent:{80,100,120}){
+        Config candidate=base;factor.scale(candidate,percent/100.);validate(candidate);
+    }
+    if(count*base.maxTime/base.sampleInterval>4e6)
+        throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase sample interval");
+    if(count*std::ceil(base.maxTime/base.dt)>2e8)
+        throw std::invalid_argument("Too many integration steps; reduce runs or simulation duration");
+    const std::filesystem::path root=std::filesystem::u8path(outputDir);
+    if(std::filesystem::exists(root)&&(!std::filesystem::is_directory(root)||!std::filesystem::is_empty(root)))
+        throw std::invalid_argument("Study output folder must be new or empty: "+outputDir);
+    std::filesystem::create_directories(root);
+    auto csv=study::open(root/"parameter_study.csv");study::summaryHeader(csv);
+    auto report=study::open(root/"parameter_findings.txt");
+    report<<"参数影响研究：单独改变一个参数均值，水平为基准的 0.8 / 1.0 / 1.2 倍\n";study::commonNotes(report);
+    study::writeConfig(base,count,seed,root/"baseline");
+    auto baseline=runBatch(base,count,seed);study::writeRunMetrics(baseline,root/"baseline");study::stripTrajectories(baseline);
     int scenarios=0;
     for(const auto&factor:factors){for(int percent:{80,100,120}){
         const std::string level=percent==80?"0.8":percent==100?"1.0":"1.2";
@@ -199,7 +217,9 @@ inline int runParameterStudy(const Config& input,int count,uint32_t seed,const s
         auto b=runBatch(c,count,seed);study::writeRunMetrics(b,dir);
         study::summaryRows(csv,factor.name,level,name,b,baseline);study::describeEffects(report,name,b,baseline);++scenarios;
     }}
-    report<<"\nCSV rows at level 1.0 reference the SAME saved baseline run set; no redundant simulations were performed.\n";
+    report<<"\nCSV 中水平1.0的各行均引用同一份已保存的基准试验，不重复运行相同场景。\n";
+    csv.flush();report.flush();
+    if(!csv||!report)throw std::runtime_error("Failed to flush study results");
     return scenarios;
 }
 }

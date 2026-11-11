@@ -16,7 +16,7 @@ inline double normalBounded(double mean,double cv,double lo,double hi,std::mt199
 }
 inline Config randomize(const Config& base,std::mt19937& rng) {
     Config c=base;
-    c.initialSpeed=normalBounded(base.initialSpeed,base.cv,0,1e5,rng);
+    c.initialSpeed=normalBounded(base.initialSpeed,base.cv,0,200,rng);
     if(base.randomSurface){
         auto sample=[&](Material& m){
             m.rollResistance=normalBounded(m.rollResistance,base.cv,0,1,rng);
@@ -32,6 +32,8 @@ inline Config randomize(const Config& base,std::mt19937& rng) {
 inline BatchResult runBatch(const Config& base,int count,uint32_t seed) {
     validate(base);
     if(count<1 || count>5000)throw std::invalid_argument("runs must be in [1,5000]");
+    if(count*std::ceil(base.maxTime/base.dt)>2e8)
+        throw std::invalid_argument("Requested integration work exceeds 200 million steps; reduce runs or time horizon");
     if(count*base.maxTime/base.sampleInterval>4e6)
         throw std::invalid_argument("Too many saved trajectory samples; reduce runs or increase --sample-interval");
     BatchResult b;b.base=base;b.seed=seed;
@@ -52,7 +54,7 @@ inline BatchResult runBatch(const Config& base,int count,uint32_t seed) {
         // so fast motion cannot skip a cell merely because output sampling is sparse.
         auto mark=[&](double x,double z){
             const double h=z-base.terrain.toeZ();
-            if(h<0 || h>10 || x<base.terrain.points.front().x || x>base.terrain.toeX()+80)return;
+            if(h<0 || h>10 || x<base.terrain.points.front().x || x>std::max(base.terrain.toeX()+80.,base.detectorX+30.))return;
             const int ix=static_cast<int>(std::floor(x/base.gridWidth));
             const int iz=std::min(static_cast<int>(b.heightCounts.size())-1,static_cast<int>(h/base.binHeight));
             visited.insert({ix,iz});

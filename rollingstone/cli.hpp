@@ -31,19 +31,15 @@ inline std::string newResultPath(const std::string& kind){
 }
 inline void cliHelp(){
     std::cout<<"Rollingstone "<<ROCK_VERSION<<" | SI units | local educational simulator\n"
-      <<"No arguments: interactive animation (Windows EasyX).\n"
+      <<"No arguments: Chinese menu (tasks 1-3).\n"
       <<"--batch --runs 200 --seed 42 [--out results/name]\n"
-      <<"--study / --terrain-study : paired parameter / geometry & surface experiments\n"
+      <<"--study : paired parameter experiments (5 parameters x 3 mean levels)\n"
       <<"--speed 1.5 --radius 2 --cv .1 --dt .002 --max-time 60 --sample-interval .02\n"
       <<"--roll .02 --friction .45 --restitution .45 --drag 1\n"
-      <<"--material rock|soil|grass --width-scale 1 --height-scale 1\n"
-      <<"--terrain-file path.csv (x_m,z_m header then ascending x,z rows)\n"
+      <<"--material rock|soil|grass (illustrative surface presets)\n"
       <<"--detector-x 120 --bin-height .5 --grid-width 1\n"
-      <<"--shape sphere|polygon --sides 5 --phase 0\n"
-      <<"--barrier none|rigid|elastic --barrier-x 112 --barrier-height 6\n"
-      <<"--stiffness 2000000 --damping 200000 --max-deflection 3 --barrier-restitution .15\n"
       <<"CV=0 disables randomness. First forward detector crossing; 0..10m above toe.\n"
-      <<"Features become available in successive task versions; --help lists the final interface.\n";
+      <<"This delivery implements tasks 1-3 only. All functionality is C++.\n";
 }
 inline int runCommandLine(int argc,char** argv){
     try{
@@ -57,7 +53,8 @@ inline int runCommandLine(int argc,char** argv){
             if(key=="--help"||key=="-h"){cliHelp();return 0;}
             if(key=="--batch"){mode="batch";continue;}
             if(key=="--study"){mode="study";continue;}
-            if(key=="--terrain-study"){mode="terrain";continue;}
+            const std::vector<std::string> allowed={"--runs","--seed","--out","--speed","--radius","--cv","--dt","--max-time","--sample-interval","--roll","--friction","--restitution","--drag","--detector-x","--bin-height","--grid-width","--material"};
+            if(std::find(allowed.begin(),allowed.end(),key)==allowed.end())throw std::invalid_argument("Unknown option in tasks 1-3: "+key);
             if(i+1>=argc)throw std::invalid_argument("Missing value for "+key);
             std::string value=argv[++i];
             auto number=[&](){size_t end=0;double v=std::stod(value,&end);if(end!=value.size()||!std::isfinite(v))throw std::invalid_argument("Invalid number for "+key);return v;};
@@ -138,6 +135,7 @@ inline int runCommandLine(int argc,char** argv){
 #if ROCK_STAGE >= 4
         if(mode=="terrain"){if(output.empty())output=newResultPath("terrain");runTerrainStudy(c,count,seed,output);std::cout<<"Saved: "<<output<<'\n';return 0;}
 #endif
+        if(!output.empty() && std::filesystem::exists(std::filesystem::u8path(output)) && !std::filesystem::is_empty(std::filesystem::u8path(output)))throw std::invalid_argument("Output folder must be new or empty: "+output);
         auto b=runBatch(c,count,seed);std::cout<<batchSummary(b);
 #if ROCK_STAGE >= 2
         if(output.empty())output=newResultPath("batch");exportBatch(b,output);

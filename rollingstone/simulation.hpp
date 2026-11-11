@@ -40,9 +40,10 @@ inline void validate(const Config& c){
     if(!finite(c.radius)||c.radius<.05||c.radius>10||!finite(c.initialSpeed)||c.initialSpeed<0||c.initialSpeed>200||
        !finite(c.density)||c.density<=0||c.density>100000||!finite(c.dt)||c.dt<.00005||c.dt>.01||
        !finite(c.maxTime)||c.maxTime<=0||c.maxTime>600||!finite(c.cv)||c.cv<0||c.cv>1||
-       !finite(c.binHeight)||c.binHeight<=0||c.binHeight>10||!finite(c.gridWidth)||c.gridWidth<.05||
+       !finite(c.binHeight)||c.binHeight<.05||c.binHeight>10||!finite(c.gridWidth)||c.gridWidth<.05||c.gridWidth>1000||
        !finite(c.sampleInterval)||c.sampleInterval<c.dt||!finite(c.detectorX)||
        !finite(c.shapePhase))throw std::invalid_argument("Invalid simulation configuration or integration step");
+    if(c.detectorX>10000 || (c.detectorX<0 && c.detectorX!=-1))throw std::invalid_argument("Collector x must be -1 (automatic) or within the domain limit of 10000m");
     if(c.detectorX>=0&&c.detectorX<=c.terrain.points.front().x)throw std::invalid_argument("Collector must be downstream of release");
     if(c.shape!=Shape::Sphere||c.barrier.kind!=BarrierKind::None)throw std::invalid_argument("This version supports spheres without barriers");
 }

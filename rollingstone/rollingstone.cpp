@@ -924,4 +924,5 @@ int originalViewer() {
     return 0;
 }
 
-int main(int argc,char** argv) { return argc>1 ? rock::runCommandLine(argc,argv) : originalViewer(); }
+#include "entry.hpp"
+int wmain(int argc,wchar_t** argv) { return rock::windowsEntry(argc,argv,originalViewer); }
