@@ -1,3 +1,3 @@
 #pragma once
-#define ROCK_STAGE 2
-#define ROCK_VERSION "v1.2"
+#define ROCK_STAGE 3
+#define ROCK_VERSION "v1.3"

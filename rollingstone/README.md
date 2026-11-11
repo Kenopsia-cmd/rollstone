@@ -30,3 +30,6 @@ v1.1：随机批量模拟、坡脚0–10m高度概率、路线网格概率、固
 
 ## v1.2 CSV输出
 运行 --batch 后自动生成 results 下带时间戳的目录；可用 --out 指定新的空目录。导出 height_probability.csv、route_probability.csv、runs.csv、trajectories.csv、sampled_surfaces.csv、terrain.csv、config.csv 及 summary.txt。列名含SI单位，未到达断面的值留空，不伪造为零。输出目录已有内容时拒绝覆盖。
+
+## v1.3 参数研究
+命令：.\build\rollingstone.exe --study --runs 200 --seed 42。初速和地表四项系数按正态分布抽样，sigma=均值绝对值×0.1，非物理取值重采样；每条轨迹内参数固定。按均值0.8/1/1.2倍做单因素配对比较，输出parameter_study.csv和从实际结果生成的分析结论。所有核心功能均为C++，CMD仅编译/启动。

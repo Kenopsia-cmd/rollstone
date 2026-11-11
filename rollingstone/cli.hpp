@@ -133,10 +133,10 @@ inline int runCommandLine(int argc,char** argv){
         for(auto& p:c.terrain.points){p.x*=c.terrainWidthScale;p.z=toeZ+(p.z-toeZ)*c.terrainHeightScale;}
         validate(c);
 #if ROCK_STAGE >= 3
-        if(mode=="study"){if(output.empty())output=newResultPath("parameters");return runParameterStudy(c,count,seed,output);}
+        if(mode=="study"){if(output.empty())output=newResultPath("parameters");runParameterStudy(c,count,seed,output);std::cout<<"Saved: "<<output<<'\n';return 0;}
 #endif
 #if ROCK_STAGE >= 4
-        if(mode=="terrain"){if(output.empty())output=newResultPath("terrain");return runTerrainStudy(c,count,seed,output);}
+        if(mode=="terrain"){if(output.empty())output=newResultPath("terrain");runTerrainStudy(c,count,seed,output);std::cout<<"Saved: "<<output<<'\n';return 0;}
 #endif
         auto b=runBatch(c,count,seed);std::cout<<batchSummary(b);
 #if ROCK_STAGE >= 2
