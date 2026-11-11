@@ -1,4 +1,6 @@
-﻿#include <graphics.h>
+#include "cli.hpp"
+using std::min; using std::max;
+#include <graphics.h>
 #include <conio.h>
 #include <math.h>
 #include <cstring>
@@ -533,7 +535,7 @@ public:
 };
 
 // ------------------------------------------------------------------ 主程序
-int main() {
+int originalViewer() {
     initgraph(WIDTH, HEIGHT);
     setbkcolor(RGB(135, 206, 235));
     BeginBatchDraw();
@@ -921,3 +923,5 @@ int main() {
     closegraph();
     return 0;
 }
+
+int main(int argc,char** argv) { return argc>1 ? rock::runCommandLine(argc,argv) : originalViewer(); }

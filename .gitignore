@@ -26,3 +26,10 @@ x86/
 *.tlog/
 *.exe
 *.vcxproj.user
+
+# Rollingstone generated files
+rollingstone/build/
+rollingstone/results/
+*.i
+*.ii
+*.s
