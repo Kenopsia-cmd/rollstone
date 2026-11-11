@@ -10,5 +10,5 @@ if not defined VSROOT (
 call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
 if not exist build mkdir build
-cl /nologo /EHsc /std:c++17 /utf-8 /W4 /O2 /D_UNICODE /DUNICODE /DNOMINMAX /I"%VSROOT%\VC\Auxiliary\VS\include" single_file\rollingstone_tasks_1_3.cpp /Fe:build\rollingstone.exe /Fo:build\rollingstone.obj /link /LIBPATH:"%VSROOT%\VC\Auxiliary\VS\lib\x64" EasyXw.lib user32.lib gdi32.lib shell32.lib
+cl /nologo /EHsc /std:c++17 /utf-8 /W4 /O2 /D_UNICODE /DUNICODE /DNOMINMAX /I"%VSROOT%\VC\Auxiliary\VS\include" single_file\rollingstone_all_tasks.cpp /Fe:build\rollingstone.exe /Fo:build\rollingstone.obj /link /LIBPATH:"%VSROOT%\VC\Auxiliary\VS\lib\x64" EasyXw.lib user32.lib gdi32.lib shell32.lib
 exit /b %errorlevel%
