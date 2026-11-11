@@ -11,3 +11,18 @@ Desktop.ini
 # 临时文件
 *.tmp
 *.swp
+
+# Visual Studio and C++ build output
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.pch
+*.tlog/
+*.exe
+*.vcxproj.user

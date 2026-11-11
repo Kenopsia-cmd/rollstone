@@ -1,50 +1,52 @@
-# 我的第一个 Git 仓库
+# Rollingstone 本地版本仓库
 
-这是位于 E:\my-first-repo 的本地 Git 仓库，主分支为 main。
+本仓库保存 Rollingstone 的版本历史。第一版已保存为 main 分支上的提交，并标记为 v1.0。
 
-## 开始使用
+## 目录与版本
 
-在 PowerShell 中进入仓库：
+| 用途 | 路径 | Git 版本 |
+| --- | --- | --- |
+| 第一版工作目录 | E:\my-first-repo\rollingstone | main |
+| 日常开发目录 | E:\my-first-repo-dev\rollingstone | dev |
+| 导入前的原始文件 | E:\资料\11.11\rollingstone | 独立原件，不会自动同步 |
+
+第一版包含 rollingstone.cpp 和 graphics.h，两份源码按原始字节复制，未修改编码或换行。
+v1.0 标签保留第一版快照；即使以后 main 有了新提交，这个标签仍指向第一版。
+本次仅保存源码，没有验证编译或运行所需的依赖。
+
+## 以后在哪里修改
+
+请打开 E:\my-first-repo-dev\rollingstone 中的文件进行开发。
+这个目录属于 dev 分支的独立 Git 工作树，文件修改不会自动改变第一版工作目录。
+两个工作树共享 Git 历史；它们不是两份独立备份，也不是运行环境或安全沙箱。
+
+每完成一段修改，在 PowerShell 中执行：
 
 ```powershell
-Set-Location 'E:\my-first-repo'
-```
-
-把项目文件放进这个文件夹，或直接在这里创建、编辑文件。每次完成一小段工作后执行：
-
-```powershell
+Set-Location 'E:\my-first-repo-dev'
 git status
-git diff
-git add .
+git add -- rollingstone
 git diff --cached
-git commit -m "描述本次修改"
+git commit -m "说明本次修改"
 ```
 
-- `git status`：查看新增、修改和暂存的文件。
-- `git diff`：查看已跟踪文件尚未暂存的修改；不显示新文件内容。
-- `git add .`：将当前文件夹中的新增、修改和删除放入暂存区（排除被忽略的文件）。
-- `git diff --cached`：检查即将提交的内容。
-- `git commit -m "描述本次修改"`：将暂存内容保存为一个可追溯版本。
+编辑器里的保存不会自动生成 Git 提交。
+若提示没有内容可提交，表示当前文件与最近一次提交一致。
 
-查看提交历史：
+## 查看版本和差异
 
 ```powershell
-git log --oneline
+Set-Location 'E:\my-first-repo-dev'
+git log --oneline --decorate --all
+git diff v1.0 -- rollingstone
+git worktree list
 ```
 
-Git 只会记录已提交的版本；编辑器里的“保存”不会自动产生提交。
-不要删除隐藏的 .git 文件夹，它保存着版本历史。
+比较命令查看开发工作目录相对于第一版的已跟踪文件差异；新增文件可通过 git status 查看。
 
-## 提交身份
+## 注意
 
-创建仓库时已使用现有 Git 配置。若将来需要仅修改本仓库的提交身份，请替换下面的示例值后执行：
-
-```powershell
-git config user.name "你的名字"
-git config user.email "你的邮箱"
-```
-
-## 云端备份（可选）
-
-当前仓库只保存在本机，尚未连接 GitHub 或 Gitee。
-如需云端备份，先在相应平台创建一个空仓库，再在本地连接远程地址并推送。
+- 保持 E:\my-first-repo 中的第一版工作目录不变，日常修改在开发目录进行。
+- 不要删除任一工作树内的 .git 文件或文件夹；开发目录依赖主仓库的 Git 数据。
+- 编译生成的 exe、obj、pdb 及 Visual Studio 缓存已加入忽略规则。
+- 本次版本保存仅在本地完成，没有上传到远程仓库。
