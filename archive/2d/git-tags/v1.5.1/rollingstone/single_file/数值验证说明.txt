@@ -1,0 +1,57 @@
+﻿山区滚石扩展核心数值验证（2026-11-11）
+
+版本范围：任务5正凸多边形、任务6刚性拦挡、任务7弹簧阻尼等效板。
+保存的复查代码：physics_extended_driver.cpp + physics_extended_tests.inc；polygon_refinement_tests.cpp。
+编译示例：g++ -O2 -std=c++20 -DROCK_STAGE=7 physics_extended_driver.cpp -o physics_tests.exe
+多边形统计复查：g++ -O2 -std=c++20 polygon_refinement_tests.cpp -o polygon_refinement.exe
+
+阶段5/6/7分别以ROCK_STAGE=5/6/7编译并执行通过。
+受控测试覆盖：原球体无拦挡路径逐步精确兼容；薄片惯量；多点冲量的非增能；
+山脊顶点对多边形边的接触；真实内部步长0.0005/0.00025/0.000125秒下的对称单次落地碰撞；
+高速越过有限高拦挡时不漏撞；板端点法向；刚性冲量及能量；越顶和稳定拦截的不同状态；
+弹性变形、真实支承力、被动能量界、逐帧状态及超容量失效后穿过。
+
+方法说明：
+1. 球体且无拦挡沿用前三项核心。扩展碰撞路径的最大内部子步0.0005秒，进一步按边界位移、转角和板固有时间尺度缩小。
+2. 外部步长0.002与0.001秒都可能使用相同的0.0005秒内步；二者一致只能证明步进一致，不能单独证明精度收敛。
+3. 地形接触包含多边形顶点和地形顶点对多边形下边界，板端点使用真实边法向。
+4. 接触冲量不冒充峰值力：刚性冲击记录累计接触冲量(N s)，刚挡不报告伪造j/dt峰值。弹挡支承力为k*q+c*v。
+5. 累积冲量、恢复和有限迭代带来的非物理增能由被动能量限制器抑制；这种数值损失未计作材料阻尼。
+6. 稳定靠板停止才标记intercepted，未到达坡脚不直接等同于拦截。超时或离域结果属于截断数据。
+7. 该等效弹挡只有一个水平平移自由度；正多边形使用与参考球等质量的均匀薄片惯量。
+
+弹性板真实内步长复核（原始坡面、球体、maxDeflection=5m）：
+h(s)       maxDeflection(m)   peakSupportForce(N)   damping/fracture loss(J)    status
+0.0005     3.361236968        7568701.003           16771207.74                 intercepted
+0.00025    3.364346647        7573468.659           16830736.71                 intercepted
+0.000125   3.365742447        7575493.562           16862623.46                 intercepted
+末两级挠度相差约0.04%，真实峰值支承力相差约0.03%。
+
+多边形ensemble复核：
+每个方案N=32，seed=42，CV=0.1，初速与地表参数随机化，5/7/8/12边形共384次模拟。
+所有方案使用相同试验编号派生的随机输入。h低于最大内步，确实改变了积分与接触子步。
+probability为坡脚0–10m通过次数/N。speedAll、energyAll对未到达的试验计零。
+pairedSpeedDiff为当前细步长减上一粗步长的逐试验速度差均值；区间为mean +/- 2.04*SE（约95%，df=31）。
+runout是已观测最远横坐标；censored>0时不能解释为最终停积距离。
+
+结论边界：
+- 所有相邻细化方案的速度配对差区间都包含0，没有在这32组样本中检出一致方向的偏差。
+- 这不等于证明数值误差为零，也不证明细微参数效应可靠；N=32的区间较宽。
+- 7/8/12边形通过率整体较稳定，但个别长时间、多次碰撞轨迹随步长有显著差异。
+- 5边形接近起滚/停滞分界，0–10m通过率从8/32到11/32；应扩大样本、改变种子并继续细化后再判断小效应。
+- 受控单次碰撞和弹性支承力验证不能替代复杂长轨迹的全局收敛证明。用于定量比较时须同时检查Monte Carlo误差和步长敏感性。
+- 该课程模型可以用于展示形状、地形和拦挡机制，尚未由现场数据标定为工程设计模型。
+
+实际输出：
+sides=5 h=0.0005 N=32 seed=42 CV=0.1 reached=8 inBand=8 probability=0.25 speedAll=2.3995233 energyAll=1763899.3 runout=50.05503 censored=1
+sides=5 h=0.00025 N=32 seed=42 CV=0.1 reached=9 inBand=9 probability=0.28125 speedAll=3.0790914 energyAll=2164165.2 runout=49.811357 censored=0 pairedSpeedDiff=0.67956813 paired95CI=[-1.032666,2.3918023] probabilityDiscordant=3
+sides=5 h=0.000125 N=32 seed=42 CV=0.1 reached=11 inBand=11 probability=0.34375 speedAll=3.4417774 energyAll=2459454.6 runout=52.3848 censored=0 pairedSpeedDiff=0.36268597 paired95CI=[-1.3391865,2.0645585] probabilityDiscordant=2
+sides=7 h=0.0005 N=32 seed=42 CV=0.1 reached=32 inBand=31 probability=0.96875 speedAll=14.502777 energyAll=13086273 runout=177.77286 censored=10
+sides=7 h=0.00025 N=32 seed=42 CV=0.1 reached=32 inBand=31 probability=0.96875 speedAll=15.583296 energyAll=15211401 runout=184.91125 censored=13 pairedSpeedDiff=1.0805182 paired95CI=[-1.0313616,3.1923979] probabilityDiscordant=2
+sides=7 h=0.000125 N=32 seed=42 CV=0.1 reached=32 inBand=31 probability=0.96875 speedAll=15.177456 energyAll=14326059 runout=184.44005 censored=15 pairedSpeedDiff=-0.40583924 paired95CI=[-2.142342,1.3306635] probabilityDiscordant=2
+sides=8 h=0.0005 N=32 seed=42 CV=0.1 reached=32 inBand=32 probability=1 speedAll=16.895368 energyAll=17044226 runout=195.04956 censored=24
+sides=8 h=0.00025 N=32 seed=42 CV=0.1 reached=32 inBand=30 probability=0.9375 speedAll=15.702719 energyAll=15225561 runout=193.21818 censored=21 pairedSpeedDiff=-1.1926491 paired95CI=[-2.6818901,0.29659203] probabilityDiscordant=2
+sides=8 h=0.000125 N=32 seed=42 CV=0.1 reached=32 inBand=30 probability=0.9375 speedAll=16.440832 energyAll=16920146 runout=193.92771 censored=24 pairedSpeedDiff=0.7381122 paired95CI=[-1.3662938,2.8425182] probabilityDiscordant=4
+sides=12 h=0.0005 N=32 seed=42 CV=0.1 reached=32 inBand=31 probability=0.96875 speedAll=18.909119 energyAll=21795425 runout=200.00301 censored=32
+sides=12 h=0.00025 N=32 seed=42 CV=0.1 reached=32 inBand=32 probability=1 speedAll=19.29554 energyAll=22830416 runout=200.00175 censored=32 pairedSpeedDiff=0.38642147 paired95CI=[-0.66376866,1.4366116] probabilityDiscordant=1
+sides=12 h=0.000125 N=32 seed=42 CV=0.1 reached=32 inBand=32 probability=1 speedAll=19.658583 energyAll=23841137 runout=199.74794 censored=31 pairedSpeedDiff=0.3630426 paired95CI=[-0.9517771,1.6778623] probabilityDiscordant=0

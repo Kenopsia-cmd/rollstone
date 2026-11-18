@@ -1,0 +1,72 @@
+山区滚石模拟：前三项任务，画布整合版 v1.3.3
+
+直接运行
+
+继续使用现有的 Visual Studio“week 9”项目。该项目引用的源码是：
+E:\my-first-repo-dev\rollingstone\single_file\rollingstone_tasks_1_3.cpp
+
+如果 Visual Studio 提示文件已在外部修改，选择重新加载。
+选择 Debug / x64，按 Ctrl+Shift+B 生成，然后按 Ctrl+F5 运行。
+程序无参数启动时直接打开统计画布，自动进行一组随机试验。
+本文件为单个 .cpp，已内联项目全部自定义代码；使用 C++17 或 C++20，依赖本机已安装的 EasyX。
+
+画布上的前三项任务
+
+1. 随机模拟与路线概率
+   左侧设置试验次数、初始速度、地表参数、CV 等，按 B 计算。
+   右侧叠加显示同一批试验的轨迹，可以回放其中一条。
+   下方显示石心首次向右通过坡脚断面时，0–10 m 高度范围的概率分布。
+   每个高度箱概率 = 该箱试验数 / 全部试验数 N。
+   未到达、低于0 m、高于10 m的试验也计入分母，单独报告数量。
+   路线热图统计每条轨迹是否通过一个网格，同一条在同格只计一次。
+   调整参数后会提示结果尚未重新计算；按 B 更新，避免把旧图当成新参数结果。
+
+2. CSV 导出
+   按 E 将当前已完成的批次导出；图上看到的轨迹与导出的数据来自同一批结果。
+   新建 results 下的独立目录，不覆盖旧结果。
+   height_probability.csv：高度分箱概率、计数、Wilson 95%区间。
+   route_probability.csv：轨迹网格概率。
+   runs.csv：逐次参数和结果。
+   trajectories.csv：时间、位置、速度、转角、动能。
+   sampled_surfaces.csv、config.csv、terrain.csv：实际抽样值与场景配置。
+
+3. 参数影响分析
+   按 A 运行参数研究，计算完成后在画布查看三水平对比图。
+   分别改变初速度、滚动阻力、摩擦系数、恢复系数、空气阻力的均值。
+   水平为当前设置的80%、100%、120%；每次只改变一项，其他设置保持相同。
+   默认CV=0.1，参数按正态分布抽样，标准差sigma=abs(mean)*CV；超出物理范围重采样。
+   五个因素共十五组对照，使用共同种子配对，基准组复用。
+   图表读取本次研究实际生成的 parameter_study.csv；误差线表示95%区间。
+   可查看0–10 m通过概率，以及到达断面的条件平均速度、条件平均能量。
+   无到达样本时不把条件速度/能量伪装成零值。
+   parameter_findings.txt 给出实际计算结果对应的中文分析。
+
+统计口径
+
+默认地形使用第一版的12个控制点，坡脚x=120 m。
+高度指石心相对坡脚高程；默认0.5 m分箱，最后一箱包含10 m。
+网格概率之和不必等于1，因为一条轨迹可以经过多个网格。
+同一随机种子、参数和可执行程序可复现结果；不同编译器的正态生成器可能产生不同样本。
+CV=0关闭随机扰动；零均值参数仍为零。
+研究表中all_runs速度/能量给未到达试验记零；given_reached才是条件到达值，画布明确使用后者。
+超过时间或计算域边界会终止试验，记录的最远位置不一定是最终停积距离。
+数值核心为二维实心球教学模型，含重力、空气阻力、碰撞恢复、摩擦与滚动阻力。
+
+命令行也可继续使用
+
+rollingstone.exe --batch --runs 500 --seed 42 --cv 0.1
+rollingstone.exe --study --runs 200 --seed 42 --cv 0.1
+rollingstone.exe --batch --material soil --out results/my_test
+rollingstone.exe --help
+
+版本位置
+
+原始第一版：E:\my-first-repo\rollingstone，main分支，v1.0。
+当前单文件：E:\my-first-repo-dev\rollingstone\single_file，tasks-1-3分支。
+v1.1记录随机试验；v1.2记录CSV；v1.3记录参数分析。
+v1.3.2-singlefile修正C++20中文路径兼容。
+v1.3.3-singlefile将前三项统计与分析真正接入默认画布。
+本次单文件不提供任务4、5或拦挡功能。
+
+也可以双击父目录 E:\my-first-repo-dev\rollingstone\run.cmd；脚本会编译同一个single_file源码，再打开画布。
+父目录rollingstone.cpp保留先前的模块化入口；本次推荐使用single_file中的.cpp。

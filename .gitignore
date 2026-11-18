@@ -1,0 +1,11 @@
+.vs/
+x64/
+Debug/
+Release/
+build_2d3d/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.vcxproj.user
+results/

@@ -1,0 +1,3 @@
+# Preserve the original source encoding and line endings.
+rollingstone/*.cpp -text
+rollingstone/*.h -text
