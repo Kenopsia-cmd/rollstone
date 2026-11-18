@@ -2,10 +2,11 @@
 x64/
 Debug/
 Release/
-build_2d3d/
+build_3d_controls/
 *.obj
 *.pdb
 *.ilk
 *.exe
+!/bin/rollingstone_3d_controls.exe
 *.vcxproj.user
 results/
