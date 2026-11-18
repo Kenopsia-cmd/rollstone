@@ -8,6 +8,7 @@
 // 图形、回放、概率和CSV使用同一计算数据。只需把本文件作为工程唯一主.cpp。
 // 3 / F3 切换至三维；左侧编辑起步、地表、地形和拦挡，Enter 应用并重跑。
 // 三维按 D 查看水平 X–Y 和竖直 X–Z 轨迹投影。
+// 三维「拦挡」或顶部「挡板能量」查看碰撞前后滚石动能。
 // 教学近似模型，未作工程标定。
 // 随机山坡 v2：成组陡缓交替，主要坡折3至5处；保持总宽高差及整体下坡。
 #ifndef NOMINMAX
@@ -114,10 +115,15 @@ struct Sample {
     bool barrierHit=false,barrierFailed=false;
     double barrierVelocity=0,barrierForce=0,barrierDissipation=0,contactImpulse=0;
 };
+struct BarrierImpact2D {
+    double time=-1;
+    double kineticBefore=0,kineticAfter=0;
+};
 struct RunResult {
     Config config;
     std::vector<Sample> trajectory;
     State finalState;
+    BarrierImpact2D firstImpact;
     bool reached=false,inBand=false;
     double detectorHeight=-1,detectorSpeed=0,detectorEnergy=0,detectorTime=0;
     double runoutX=0,maxSpeed=0,maxEnergy=0,maxBounceHeight=0;
@@ -472,8 +478,11 @@ inline void finishPanel(State& s,const Config& c){
         s.barrierDissipation+=panelStored(s,c);s.barrierFailed=true;s.barrierVelocity=0;s.barrierForce=0;
     }
 }
-inline void barrierImpulse(State& s,const Config& c,double h,double approachSide){
+inline void barrierImpulse(State& s,const Config& c,double h,double approachSide,BarrierImpact2D* firstImpact){
     auto contacts=barrierContacts(s,c,approachSide);if(contacts.empty())return;
+    const bool record=firstImpact&&firstImpact->time<0;
+    const double impulseBefore=s.contactImpulse;
+    const double kineticBefore=record?kineticEnergy(s):0;
     s.barrierHit=true;const bool elastic=c.barrier.kind==BarrierKind::Elastic;
     const auto& b=c.barrier;const double denominator=elastic?1+h*b.damping/b.mass+h*h*b.stiffness/b.mass:1;
     const double panelBefore=s.barrierVelocity;
@@ -490,6 +499,9 @@ inline void barrierImpulse(State& s,const Config& c,double h,double approachSide
         }
     }
     for(const auto& q:contacts)s.contactImpulse+=q.jn;
+    if(record&&s.contactImpulse>impulseBefore){
+        *firstImpact={s.time,kineticBefore,kineticEnergy(s)};
+    }
     if(elastic)s.barrierDissipation+=h*b.damping*(s.barrierVelocity*s.barrierVelocity-panelBefore*panelBefore);
     // Resolve remaining geometry against the current panel position. The panel itself
     // is never displaced by projection, so correction cannot invent spring energy.
@@ -505,7 +517,7 @@ inline double advancedStepLimit(const State& s,const Config& c){
     if(c.barrier.kind==BarrierKind::Elastic&&!s.barrierFailed)h=std::min(h,.05*std::sqrt(c.barrier.mass/c.barrier.stiffness));
     return h;
 }
-inline void advancedSubstep(State& s,const Config& c,double h){
+inline void advancedSubstep(State& s,const Config& c,double h,BarrierImpact2D* firstImpact=nullptr){
     if(++s.integrationSteps>5000000)throw std::runtime_error("One trajectory exceeded five million collision substeps; reduce its duration or stiffness");
     const State previous=s;
     const double previousEnergy=kineticEnergy(s)+s.mass*G*s.p.z+panelStored(s,c)+s.barrierDissipation;
@@ -526,7 +538,7 @@ inline void advancedSubstep(State& s,const Config& c,double h){
         const double dw=material.rollResistance*s.mass*G*normal.z*c.radius*h/s.inertia;
         s.omega=std::copysign(std::max(0.,std::abs(s.omega)-dw),s.omega);
     }
-    barrierImpulse(s,c,h,approachSide);
+    barrierImpulse(s,c,h,approachSide,firstImpact);
     // Passive energy guard for discretization/projection error. Initial overlaps are
     // invalid starting states; the normal initialized configurations have no overlap.
     const double panelK=c.barrier.kind==BarrierKind::Elastic&&!s.barrierFailed?.5*c.barrier.mass*s.barrierVelocity*s.barrierVelocity:0;
@@ -558,14 +570,14 @@ inline void advancedSubstep(State& s,const Config& c,double h){
         throw std::runtime_error("Nonfinite extended physics state");
 }
 } // namespace detail
-template<class Observer> inline void stepObserved(State& s,const Config& c,Observer&& observe){
+template<class Observer> inline void stepObserved(State& s,const Config& c,Observer&& observe,BarrierImpact2D* firstImpact=nullptr){
     if(!s.moving)return;
     if(c.shape==Shape::Sphere&&c.barrier.kind==BarrierKind::None){const State previous=s;stepSphereLegacy(s,c);observe(previous,s);return;}
     double remaining=c.dt;int substeps=0;
     while(remaining>1e-12&&s.moving){
         const double h=std::min(remaining,detail::advancedStepLimit(s,c));
         if(++substeps>20000||h<1e-10)throw std::runtime_error("Extended collision substep limit exceeded");
-        const State previous=s;detail::advancedSubstep(s,c,h);observe(previous,s);remaining-=h;
+        const State previous=s;detail::advancedSubstep(s,c,h,firstImpact);observe(previous,s);remaining-=h;
     }
 }
 inline void step(State& s,const Config& c){stepObserved(s,c,[](const State&,const State&){});}
@@ -598,7 +610,7 @@ inline RunResult simulate(const Config& c){
             result.inBand=result.detectorHeight>=0&&result.detectorHeight<=10;
         }
         if(s.time+1e-9>=nextSample){result.trajectory.push_back(sample(s));nextSample+=c.sampleInterval;}
-        });
+        },&result.firstImpact);
     }
     if(result.trajectory.back().t<s.time-1e-9)result.trajectory.push_back(sample(s));
     if(s.moving){s.stopReason="time_limit";s.moving=false;}
@@ -1456,6 +1468,7 @@ const COLORREF BG=RGB(13,23,36),PANEL=RGB(22,36,52),INK=RGB(236,243,250),MUTED=R
 const COLORREF ACCENT=RGB(69,211,175),SKYBLUE=RGB(80,169,244),ORANGE=RGB(255,174,83);
 struct Rect {int l,t,r,b; bool contains(int x,int y)const{return x>=l&&x<=r&&y>=t&&y<=b;}};
 constexpr Rect switchTo3D{1080,60,1265,89};
+constexpr Rect barrierEnergyButton{24,495,316,534};
 inline std::wstring wide(const std::string& s){
     if(s.empty())return L"";
     int n=MultiByteToWideChar(CP_UTF8,0,s.data(),static_cast<int>(s.size()),nullptr,0);
@@ -1585,6 +1598,7 @@ struct View {
     IMAGE energyCache;
     bool chromeCacheValid=false,energyCacheValid=false,forceRender=true;
     int cachedPage=-1,cachedRow=-1,cachedPreset=-1,cachedFactor=-1,cachedTerrainFactor=-1,cachedTrial=-1;
+    int cachedView=-1;
     bool cachedPlaying=false,cachedMulti=false,cachedBusy=false,cachedStale=false,cachedHasData=false,cachedOutput=false;
     std::wstring cachedNote,cachedValues;
     const RunResult* cachedEnergyRun=nullptr;
@@ -1775,7 +1789,7 @@ struct View {
         const int n=many?count:1;const uint32_t s=seed;
         jobStart=std::chrono::steady_clock::now();
         future=std::async(std::launch::async,[c,n,s]{return runBatch(c,n,s);});
-        setView(many&&ROCK_STAGE>=8?4:0);
+        if(!(page==4&&energyMode))setView(many&&ROCK_STAGE>=8?4:0);
         note=many?L"正在批量计算；可继续查看现有回放。":L"正在计算固定参数单次轨迹。";
     }
     void beginStudy(){
@@ -2019,6 +2033,9 @@ struct View {
             text(29,435,L"拦挡位置为实际世界坐标 x",14,MUTED);
             text(29,465,L"与滚石轮廓接触时改变速度",14,MUTED);}
 #endif
+#if ROCK_STAGE >= 8
+        if(page==4)button(barrierEnergyButton,L"挡板能量曲线  F",energyMode);
+#endif
     }
     void histogram(){
         Rect area{370,617,826,806};box(area,PANEL);text(385,627,L"首次通过坡脚断面的路线概率",17);
@@ -2258,19 +2275,28 @@ struct View {
     }
     void renderEnergyStatic(){
 #if ROCK_STAGE >= 8
-        box({370,138,1266,798},RGB(17,30,46));text(385,151,L"当前试验的能量随时间变化",20);
+        box({370,138,1266,798},RGB(17,30,46));text(385,151,L"滚石能量与挡板碰撞",20);
         if(!hasData()||current().trajectory.empty()){text(405,290,L"先运行 B 生成轨迹，再查看能量曲线。",20,MUTED);return;}
         const auto& run=current();const auto& samples=run.trajectory;const double mass=run.finalState.mass,toe=run.config.terrain.toeZ();
         const Rect graph{425,220,1238,496};const double end=(std::max)(.001,samples.back().t);
         double lower=0,upper=1;
         for(const auto& point:samples){const double potential=mass*G*(point.z-toe)/1e6,total=point.energy/1e6+potential;
             lower=(std::min)(lower,potential);upper=(std::max)(upper,(std::max)(point.energy/1e6,total));}
+        const auto& impact=run.firstImpact;
+        if(impact.time>=0)upper=std::max({upper,impact.kineticBefore/1e6,impact.kineticAfter/1e6});
         upper*=1.08;lower=lower<0?lower*1.08:0;
         auto xx=[&](double t){return graph.l+static_cast<int>(t/end*(graph.r-graph.l));};
         auto yy=[&](double e){return graph.b-static_cast<int>((e-lower)/(upper-lower)*(graph.b-graph.t));};
         for(int i=0;i<=5;++i){const double t=end*i/5.,e=lower+(upper-lower)*i/5.;
             lineAt(xx(t),graph.t,xx(t),graph.b,RGB(40,56,74));text(xx(t)-12,graph.b+6,num(t,1),11,MUTED);
             lineAt(graph.l,yy(e),graph.r,yy(e),RGB(40,56,74));text(375,yy(e)-7,num(e,1),11,MUTED);}
+        const COLORREF hitColor=RGB(245,148,184);
+        if(impact.time>=0){
+            const int x=xx(impact.time);
+            setlinecolor(hitColor);setlinestyle(PS_DASH,1);line(x,graph.t,x,graph.b);
+            const auto label=L"首次碰撞 "+num(impact.time,3)+L" s";
+            fittedText(std::clamp(x+8,graph.l+4,graph.r-180),graph.t-22,176,label,14,hitColor);
+        }
         const COLORREF colors[]={SKYBLUE,ORANGE,ACCENT};const wchar_t* names[]={L"动能",L"重力势能",L"滚石机械能"};
         thread_local std::vector<POINT> pts;
         for(int type=0;type<3;++type){text(600+type*180,180,names[type],14,colors[type]);
@@ -2278,11 +2304,14 @@ struct View {
             pts.clear();for(const auto& s:samples)pts.push_back({xx(s.t),yy(energy(s))});
             setlinecolor(colors[type]);setlinestyle(PS_SOLID,2);
             if(pts.size()>1)polyline(pts.data(),static_cast<int>(pts.size()));}
+        if(impact.time>=0){
+            const int x=xx(impact.time), before=yy(impact.kineticBefore/1e6), after=yy(impact.kineticAfter/1e6);
+            lineAt(x,before,x,after,hitColor,3);
+            lineAt(x-4,before,x+4,before,hitColor,2);
+            setfillcolor(hitColor);solidcircle(x,after,4);
+        }
         text(385,191,L"能量 / MJ",13,MUTED);text(1184,516,L"时间 / s",12,MUTED);
-        text(385,598,L"拖动时间轴定位；PageUp / PageDown 选择试验。所有值取自同一条 CSV 轨迹。",13,MUTED);
-        text(400,681,L"势能以坡脚高程为零点；机械能 = 平动与转动动能 + 重力势能。",14,MUTED);
-        if(run.config.barrier.kind!=BarrierKind::Elastic)text(400,715,L"接触碰撞、摩擦与空气阻力会耗能；曲线显示计算结果，不假设机械能恒定。",14,MUTED);
-        text(400,751,L"F 进入能量视图；M 返回多颗同步回放；V 切换全部视图。",14,ACCENT);
+        text(385,598,L"拖动时间轴定位；PageUp / PageDown 选择试验。曲线和 CSV 使用同一条模拟轨迹。",13,MUTED);
 #endif
     }
     void renderEnergy(){
@@ -2301,25 +2330,30 @@ struct View {
         if(!hasData()||current().trajectory.empty())return;
         const auto& run=current();const auto& samples=run.trajectory;const double mass=run.finalState.mass,toe=run.config.terrain.toeZ();
         const Rect graph{425,220,1238,496};const double end=(std::max)(.001,samples.back().t);
-        double lower=0,upper=1;
-        for(const auto& point:samples){const double potential=mass*G*(point.z-toe)/1e6,total=point.energy/1e6+potential;
-            lower=(std::min)(lower,potential);upper=(std::max)(upper,(std::max)(point.energy/1e6,total));}
-        upper*=1.08;lower=lower<0?lower*1.08:0;
         auto xx=[&](double t){return graph.l+static_cast<int>(t/end*(graph.r-graph.l));};
         const double at=(std::min)(time,end);lineAt(xx(at),graph.t,xx(at),graph.b,INK,1);
-        const auto p=sample();const double kinetic=p.energy/1e6,potential=mass*G*(p.z-toe)/1e6;
+        const auto p=sampleAt(run,at);const double kinetic=p.energy/1e6,potential=mass*G*(p.z-toe)/1e6;
         text(385,539,L"试验 "+num(trial+1,0)+L"   t="+num(at)+L" s   速度 "+num(std::hypot(p.vx,p.vz),2)+L" m/s   结局："+stopName(run),15);
         box(timeline,RGB(36,55,74));const double playbackEnd=replayEnd();const int cursor=timeline.l+static_cast<int>((timeline.r-timeline.l)*(playbackEnd>0?time/playbackEnd:0));
         box({timeline.l,timeline.t,cursor,timeline.b},RGB(38,117,113));setfillcolor(ACCENT);solidcircle(cursor,(timeline.t+timeline.b)/2,7);
         box({382,628,1253,786},PANEL);
         text(400,643,L"当前动能 "+num(kinetic,3)+L" MJ",18,SKYBLUE);text(680,643,L"当前势能 "+num(potential,3)+L" MJ",18,ORANGE);
         text(961,643,L"机械能 "+num(kinetic+potential,3)+L" MJ",18,ACCENT);
-        text(400,681,L"势能以坡脚高程为零点；机械能 = 平动与转动动能 + 重力势能。",14,MUTED);
+        const auto& impact=run.firstImpact;
+        if(impact.time>=0){
+            const double change=(impact.kineticAfter-impact.kineticBefore)/1000.;
+            const std::wstring sign=change>0?L"+":L"";
+            fittedText(400,681,830,L"首次碰撞 "+num(impact.time,3)+L" s    滚石动能 "+
+                num(impact.kineticBefore/1000.,2)+L" → "+num(impact.kineticAfter/1000.,2)+L" kJ    变化 "+sign+num(change,2)+L" kJ",17,RGB(245,148,184));
+        }else{
+            const bool hasBarrier=run.config.barrier.kind!=BarrierKind::None;
+            text(400,681,hasBarrier?L"本次没有测到挡板碰撞，动能曲线仍反映滚动与地面碰撞。":L"本次没有设置挡板。到左侧「拦挡」选择挡板后，按 Enter 重跑。",16,ACCENT);
+        }
         if(run.config.barrier.kind==BarrierKind::Elastic){const auto& b=run.config.barrier;
             const double stored=p.barrierFailed?0:(.5*b.stiffness*p.deflection*p.deflection+.5*b.mass*p.barrierVelocity*p.barrierVelocity)/1e6;
-            text(400,715,L"弹性板储能 "+num(stored,3)+L" MJ    拦挡耗散 "+num(p.barrierDissipation/1e6,3)+L" MJ    当前力 "+num(p.barrierForce/1000.,1)+L" kN",14);
-        }else text(400,715,L"接触碰撞、摩擦与空气阻力会耗能；曲线显示计算结果，不假设机械能恒定。",14,MUTED);
-        text(400,751,L"F 进入能量视图；M 返回多颗同步回放；V 切换全部视图。",14,ACCENT);
+            text(400,715,L"弹性板自身能量 "+num(stored*1000.,2)+L" kJ    板阻尼耗散 "+num(p.barrierDissipation/1000.,2)+L" kJ    当前力 "+num(p.barrierForce/1000.,1)+L" kN",15);
+        }else text(400,715,L"地面碰撞、摩擦和空气阻力也会改变能量。",15,MUTED);
+        text(400,751,L"首碰数值取自挡板冲量前后。势能以坡脚高程为零点。",14,MUTED);
 #endif
     }
     void renderChrome(){
@@ -2348,7 +2382,7 @@ struct View {
         const bool stale=terrainMode?terrainDirty:analysisMode?studyDirty:dirty;
         const bool outputEmpty=lastOutput.empty();
         const std::wstring values=valueKey();
-        if(!chromeCacheValid||cachedPage!=page||cachedRow!=chosenRow||cachedPreset!=materialPreset||
+        if(!chromeCacheValid||cachedPage!=page||cachedRow!=chosenRow||cachedPreset!=materialPreset||cachedView!=activeView()||
            cachedPlaying!=playing||cachedMulti!=multiReplay||cachedBusy!=busyNow||cachedStale!=stale||
            cachedHasData!=hasData()||cachedOutput!=outputEmpty||cachedNote!=note||cachedValues!=values){
             if(chromeCache.getwidth()!=W||chromeCache.getheight()!=H)chromeCache.Resize(W,H);
@@ -2356,7 +2390,7 @@ struct View {
             try{renderChrome();}
             catch(...){SetWorkingImage(previous);throw;}
             SetWorkingImage(previous);
-            chromeCacheValid=true;cachedPage=page;cachedRow=chosenRow;cachedPreset=materialPreset;
+            chromeCacheValid=true;cachedPage=page;cachedRow=chosenRow;cachedPreset=materialPreset;cachedView=activeView();
             cachedPlaying=playing;cachedMulti=multiReplay;cachedBusy=busyNow;cachedStale=stale;
             cachedHasData=hasData();cachedOutput=outputEmpty;cachedNote=note;cachedValues=values;
         }
@@ -2405,6 +2439,7 @@ struct View {
         if(Rect{590,58,746,89}.contains(x,y)){setView(4);return;}
         if(Rect{757,58,911,89}.contains(x,y)){toggleMulti();return;}
         if(Rect{921,58,1071,89}.contains(x,y)){setView(3);return;}
+        if(page==4&&barrierEnergyButton.contains(x,y)){setView(3);return;}
 #endif
         if(analysisMode)for(int i=0;i<5;++i)if(Rect{380+i*175,149,548+i*175,184}.contains(x,y)){factorIndex=i;return;}
         if(terrainMode)for(int i=0;i<4;++i)if(Rect{380+i*220,149,590+i*220,184}.contains(x,y)){terrainFactor=i;return;}
@@ -2568,9 +2603,9 @@ constexpr int sceneLeft = 325;
 constexpr int sceneTop = 55;
 constexpr int sceneBottom = H - 122;
 constexpr int splitX = 758;
-enum class ViewMode { Perspective, Sections, Together };
+enum class ViewMode { Perspective, Sections, Together, BarrierEnergy };
 constexpr rock::ui::Rect viewButtons[] = {
-    {287, 9, 393, 45}, {399, 9, 527, 45}, {533, 9, 665, 45}
+    {260, 9, 344, 45}, {350, 9, 467, 45}, {473, 9, 585, 45}, {591, 9, 733, 45}
 };
 
 struct Settings {
@@ -2816,10 +2851,23 @@ struct Ball {
     double kinetic() const { return 0.5 * mass * speed() * speed() * (1.0 + 2.0 / 5.0); }
 };
 
+struct EnergyPoint {
+    double t = 0, kinetic = 0, potential = 0;
+};
+
+struct BarrierImpact {
+    double t = 0, before = 0, after = 0;
+};
+
+inline EnergyPoint rockEnergyPoint(const Ball& ball) {
+    return {ball.t, ball.kinetic(), ball.mass * G3 * ball.z};
+}
+
 struct Barrier3D {
     double deflection = 0, velocity = 0;
     bool failed = false;
     int contacts = 0;
+    BarrierImpact lastImpact;
 
     double wallX(const Settings& settings, const Terrain& terrain) const {
         return nominalX(settings, terrain) + deflection;
@@ -2937,6 +2985,7 @@ struct Barrier3D {
         const double restitution = relativeNormal < -0.25 ? settings.barrierRestitution : 0;
         const double inverseMass = 1.0 / ball.mass + (elastic ? normal.x * normal.x / panelMass : 0);
         const double impulse = -(1.0 + restitution) * relativeNormal / inverseMass;
+        const double kineticBefore = touching ? 0.0 : ball.kinetic();
         ball.vx += normal.x * impulse / ball.mass;
         ball.vy += normal.y * impulse / ball.mass;
         ball.vz += normal.z * impulse / ball.mass;
@@ -2944,6 +2993,7 @@ struct Barrier3D {
         if (ball.speed() > 1e-8 && ball.t <= 90.) ball.resting = false;
         if (elastic) velocity -= normal.x * impulse / panelMass;
         if (!touching) {
+            lastImpact = {ball.t, kineticBefore, ball.kinetic()};
             ++contacts;
             touching = true;
         }
@@ -3197,8 +3247,8 @@ inline void renderHUD(const Ball& B, const Terrain& T, uint32_t seed, bool pause
     setfillcolor(RGB(14, 26, 44));
     solidrectangle(0, 0, W, 54);
     text3(20, 14, L"山区滚石 · 3D 模拟", 22, RGB(238, 242, 247));
-    const wchar_t* labels[] = {L"立体", L"轨迹截面", L"3D ＋截面"};
-    for (int i = 0; i < 3; ++i)
+    const wchar_t* labels[] = {L"立体", L"轨迹截面", L"3D ＋截面", L"挡板能量"};
+    for (int i = 0; i < 4; ++i)
         rock::ui::button(viewButtons[i], labels[i], !pickingRelease && static_cast<int>(viewMode) == i);
     swprintf(buf, 256, L"地形种子 %u   %s   %.2f×", seed, paused ? L"暂停" : B.resting ? L"已停止" : L"运行", speedScale);
     text3(W - 530, 17, buf, 17, RGB(150, 190, 225));
@@ -3411,8 +3461,177 @@ inline void renderSections(const Terrain& terrain, const Ball& ball, const Setti
     }
 }
 
+inline void renderBarrierEnergy(const rock::ui::Rect& area, const std::vector<EnergyPoint>& history,
+                                const std::vector<BarrierImpact>& impacts, const EnergyPoint& current,
+                                const Settings& active) {
+    using rock::ui::Rect;
+    using rock::ui::box;
+    using rock::ui::fittedText;
+    using rock::ui::lineAt;
+    using rock::ui::num;
+    using rock::ui::text;
+
+    const COLORREF card = RGB(17, 29, 47), inset = RGB(24, 40, 59), grid = RGB(42, 61, 81);
+    const COLORREF ink = RGB(234, 243, 249), muted = RGB(170, 194, 213);
+    const COLORREF kineticColor = RGB(91, 204, 253), potentialColor = RGB(144, 211, 189);
+    const COLORREF mechanicalColor = RGB(255, 206, 122), impactColor = RGB(249, 161, 206);
+    const bool hasBarrier = active.barrierKind != rock::BarrierKind::None;
+    const Rect panel{area.l + 10, area.t + 10, area.r - 10, area.b - 10};
+    const int left = panel.l + 18, right = panel.r - 18, top = panel.t;
+    const bool compact = right - left < 630;
+    box(panel, card);
+    text(left, top + 12, L"挡板对滚石能量的影响", 23, ink);
+    const wchar_t* barrierName = !hasBarrier ? L"无挡板" :
+        active.barrierKind == rock::BarrierKind::Elastic ? L"弹性挡板" : L"刚性挡板";
+    const std::wstring status = std::wstring(barrierName) + L"  ·  已记录 " +
+                                std::to_wstring(impacts.size()) + L" 次碰撞";
+    fittedText(left, top + 45, right - left, status, 17, muted);
+
+    auto mechanical = [](const EnergyPoint& point) { return point.kinetic + point.potential; };
+    double minEnergy = 0, maxEnergy = 0;
+    auto includeEnergy = [&](double value) {
+        minEnergy = std::min(minEnergy, value);
+        maxEnergy = std::max(maxEnergy, value);
+    };
+    auto includePoint = [&](const EnergyPoint& point) {
+        includeEnergy(point.kinetic);
+        includeEnergy(point.potential);
+        includeEnergy(mechanical(point));
+    };
+    includePoint(current);
+    for (const auto& point : history) includePoint(point);
+    for (const auto& impact : impacts) {
+        includeEnergy(impact.before);
+        includeEnergy(impact.after);
+    }
+    const double magnitude = std::max(std::abs(minEnergy), maxEnergy);
+    const double divisor = magnitude >= 1e6 ? 1e6 : magnitude >= 1e3 ? 1e3 : 1.0;
+    const wchar_t* unit = divisor == 1e6 ? L"MJ" : divisor == 1e3 ? L"kJ" : L"J";
+    auto energyValue = [&](double energy, bool showSign = false) {
+        const double value = energy / divisor;
+        const int digits = std::abs(value) >= 100 ? 1 : 3;
+        return (showSign && value > 0 ? std::wstring(L"+") : std::wstring()) +
+            num(value, digits) + L" " + unit;
+    };
+
+    const int cardsTop = top + 77, cardsBottom = top + 158;
+    if (impacts.empty()) {
+        box({left, cardsTop, right, cardsBottom}, inset);
+        text(left + 12, cardsTop + 10, hasBarrier ? L"尚未记录到挡板碰撞" : L"当前配置没有挡板",
+             19, impactColor);
+        fittedText(left + 12, cardsTop + 45, right - left - 24,
+                   hasBarrier ? L"碰到挡板后，此处显示碰撞前后的瞬时动能。"
+                              : L"启用刚性或弹性挡板并应用设置，即可观察碰撞前后的动能。",
+                   16, muted);
+    } else {
+        const auto& first = impacts.front();
+        const double change = first.after - first.before;
+        constexpr int gap = 8;
+        const int width = (right - left - 2 * gap) / 3;
+        const int col2 = left + width + gap, col3 = col2 + width + gap;
+        auto metric = [&](int x, int end, const wchar_t* label, const std::wstring& value, COLORREF color) {
+            box({x, cardsTop, end, cardsBottom}, inset);
+            fittedText(x + 10, cardsTop + 9, end - x - 20, label, 16, muted);
+            fittedText(x + 10, cardsTop + 40, end - x - 20, value, compact ? 19 : 24, color);
+        };
+        metric(left, col2 - gap, L"首次撞板前 · 动能", energyValue(first.before), kineticColor);
+        metric(col2, col3 - gap, L"首次撞板后 · 动能", energyValue(first.after), kineticColor);
+        metric(col3, right, L"动能变化（后减前）", energyValue(change, true), impactColor);
+    }
+
+    const Rect plot{left + (compact ? 56 : 76), top + 228, right - 11, panel.b - 83};
+    auto tickStep = [](double span, int tickCount) {
+        const double rough = span / tickCount;
+        const double decade = std::pow(10.0, std::floor(std::log10(rough)));
+        const double factor = rough / decade;
+        return (factor <= 1 ? 1 : factor <= 2 ? 2 : factor <= 5 ? 5 : 10) * decade;
+    };
+    const double timeSpan = std::max(2.0, current.t);
+    const double tStep = tickStep(timeSpan, compact ? 5 : 8);
+    const double tMax = std::ceil(timeSpan / tStep) * tStep;
+    const double eStep = tickStep(std::max(1.0, (maxEnergy - minEnergy) / divisor), 6);
+    const double eMin = std::floor(minEnergy / divisor / eStep) * eStep;
+    const double eMax = std::max(eMin + eStep, std::ceil(maxEnergy / divisor / eStep) * eStep);
+    auto px = [&](double time) {
+        return plot.l + static_cast<int>(std::lround(std::clamp(time / tMax, 0.0, 1.0) * (plot.r - plot.l)));
+    };
+    auto py = [&](double energy) {
+        return plot.b - static_cast<int>(std::lround(std::clamp((energy / divisor - eMin) / (eMax - eMin),
+                                                               0.0, 1.0) * (plot.b - plot.t)));
+    };
+
+    box(plot, RGB(11, 22, 37));
+    for (double time = 0; time <= tMax + 0.001 * tStep; time += tStep) {
+        const int x = px(time);
+        lineAt(x, plot.t, x, plot.b, grid);
+        const auto label = num(time, tStep < 1 ? 1 : 0);
+        rock::ui::fontStyle(16);
+        text(x - textwidth(label.c_str()) / 2, plot.b + 7, label, 16, muted);
+    }
+    for (double energy = eMin; energy <= eMax + 0.001 * eStep; energy += eStep) {
+        const int y = py(energy * divisor);
+        lineAt(plot.l, y, plot.r, y, std::abs(energy) < eStep * 0.001 ? RGB(93, 120, 145) : grid);
+        const auto label = num(std::abs(energy) < eStep * 0.001 ? 0.0 : energy, eStep < 1 ? 1 : 0);
+        rock::ui::fontStyle(16);
+        text(plot.l - 9 - textwidth(label.c_str()), y - 9, label, 16, muted);
+    }
+    text(left, plot.t - 23, std::wstring(L"能量 / ") + unit, 16, muted);
+    text(plot.r - 61, plot.b + 28, L"时间 / s", 16, muted);
+
+    auto legend = [&](int x, const wchar_t* label, COLORREF color) {
+        lineAt(x, top + 183, x + 20, top + 183, color, 3);
+        text(x + 26, top + 173, label, 16, muted);
+    };
+    legend(left, L"动能", kineticColor);
+    legend(left + 75, L"重力势能", potentialColor);
+    legend(left + 180, L"机械能", mechanicalColor);
+    legend(left + 267, L"碰撞", impactColor);
+    for (const auto& impact : impacts) {
+        const int x = px(impact.t);
+        setlinestyle(PS_DASH, 1);
+        setlinecolor(RGB(137, 83, 132));
+        line(x, plot.t, x, plot.b);
+    }
+
+    auto curve = [&](auto value, COLORREF color) {
+        std::vector<POINT> trace;
+        trace.reserve(history.size() + 1);
+        for (const auto& point : history) trace.push_back({px(point.t), py(value(point))});
+        const POINT last{px(current.t), py(value(current))};
+        trace.push_back(last);
+        setlinecolor(color);
+        setlinestyle(PS_SOLID, 2);
+        if (trace.size() >= 2) polyline(trace.data(), static_cast<int>(trace.size()));
+        if (trace.size() == 1) {
+            setfillcolor(color);
+            solidcircle(last.x, last.y, 4);
+        }
+    };
+    curve([](const EnergyPoint& point) { return point.potential; }, potentialColor);
+    curve(mechanical, mechanicalColor);
+    curve([](const EnergyPoint& point) { return point.kinetic; }, kineticColor);
+    int lastLabelX = plot.l - 40;
+    for (size_t i = 0; i < impacts.size(); ++i) {
+        const auto& impact = impacts[i];
+        const int x = px(impact.t);
+        const int before = py(impact.before), after = py(impact.after);
+        lineAt(x, before, x, after, impactColor, 2);
+        setfillcolor(impactColor);
+        solidcircle(x, before, 4);
+        solidcircle(x, after, 4);
+        if (x - lastLabelX >= 38) {
+            text(x - 6, plot.t - 20, std::to_wstring(i + 1), 16, impactColor);
+            lastLabelX = x;
+        }
+    }
+
+    const std::wstring footer = impacts.empty() ? L"机械能 = 动能 + 重力势能。势能以 z = 0 为基准。"
+        : L"首次碰撞 " + num(impacts.front().t, 2) + L" s。粉色标记显示碰撞瞬间的动能变化。";
+    fittedText(left, panel.b - 24, right - left, footer, 16, muted);
+}
+
 struct SettingsPanel {
-    enum class Action { None, Apply, PickRelease };
+    enum class Action { None, Apply, PickRelease, ShowBarrierEnergy };
 
     Settings pending;
     bool dirty = false;
@@ -3489,13 +3708,13 @@ struct SettingsPanel {
             L"沿坡为 x，横向为 y，向上为 z。",
             L"地表系数用于整个三维地形。",
             L"相同种子与设置会生成相同地形。",
-            L"挡板位置与宽度受山坡范围限制。"
+            L"右侧能量图随已应用的模拟更新。"
         };
         text3(16, 511, help[page], 16, muted);
         if (!notice.empty()) {
             rock::ui::fittedText(16, 534, 294, notice, 16, RGB(255, 172, 124));
         } else {
-            text3(16, 534, dirty ? L"待应用" : L"参数已应用", 16,
+            text3(16, 534, dirty ? L"待应用 · 当前显示上次模拟" : L"参数已应用", 16,
                   dirty ? RGB(255, 204, 120) : RGB(134, 214, 190));
         }
         button(16, 563, 187, 604, L"应用并重跑", true);
@@ -3510,7 +3729,7 @@ struct SettingsPanel {
             if (inside(x, y, left, 112, left + tabWidth, 149)) {
                 page = i;
                 notice.clear();
-                return Action::None;
+                return page == barrierPage ? Action::ShowBarrierEnergy : Action::None;
             }
         }
         if (page == barrierPage) {
@@ -3724,6 +3943,8 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
     Barrier3D barrier;
     Camera cam;
     std::vector<TrailPt> history;
+    std::vector<EnergyPoint> energy;
+    std::vector<BarrierImpact> impacts;
     bool paused = false, trailOn = true, pickingRelease = false;
     ViewMode viewMode = ViewMode::Perspective;
     double lastRecorded = 0;
@@ -3745,6 +3966,9 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
         barrier = Barrier3D{};
         history.clear();
         history.push_back({B.x, B.y, B.z});
+        energy.clear();
+        energy.push_back(rockEnergyPoint(B));
+        impacts.clear();
         lastRecorded = B.t;
         paused = false;
     };
@@ -3808,7 +4032,7 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
                     if (rock::ui::Rect{W - 185, 9, W - 16, 45}.contains(m.x, m.y)) {
                         result = 0; quit = true; break;
                     }
-                    for (int i = 0; i < 3; ++i) {
+                    for (int i = 0; i < 4; ++i) {
                         if (viewButtons[i].contains(m.x, m.y)) {
                             pickingRelease = false;
                             viewMode = static_cast<ViewMode>(i);
@@ -3819,6 +4043,11 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
                     if (m.x < sceneLeft && m.y >= sceneTop && m.y < sceneBottom) {
                         const auto action = panel.click(m.x, m.y);
                         if (action == SettingsPanel::Action::Apply) apply();
+                        if (action == SettingsPanel::Action::ShowBarrierEnergy) {
+                            viewMode = ViewMode::BarrierEnergy;
+                            pickingRelease = false;
+                            dragging = false;
+                        }
                         if (action == SettingsPanel::Action::PickRelease) {
                             pickingRelease = !pickingRelease;
                         }
@@ -3863,7 +4092,8 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
                     case 'N': adjustTerrain([](Settings& s) { ++s.seed; }); break;
                     case 'T': trailOn = !trailOn; break;
                     case 'D':
-                        viewMode = static_cast<ViewMode>((static_cast<int>(viewMode) + 1) % 3);
+                        viewMode = viewMode == ViewMode::BarrierEnergy ? ViewMode::Perspective
+                            : static_cast<ViewMode>((static_cast<int>(viewMode) + 1) % 3);
                         pickingRelease = false; dragging = false;
                         break;
                     case VK_OEM_4: adjustTerrain([](Settings& s) { s.segments = std::max(3, s.segments - 1); }); break;
@@ -3887,11 +4117,21 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
             steps = std::clamp(steps, 1, 400);
             for (int i = 0; i < steps; ++i) {
                 const double oldX = B.x, oldY = B.y, oldZ = B.z;
+                const int previousContacts = barrier.contacts;
                 B.step(T, dt);
                 barrier.step(settings, T, B, dt, oldX, oldY, oldZ);
+                const bool impact = barrier.contacts != previousContacts;
+                if (impact) {
+                    const auto& event = barrier.lastImpact;
+                    const auto point = rockEnergyPoint(B);
+                    energy.push_back({event.t, event.before, point.potential});
+                    energy.push_back({event.t, event.after, point.potential});
+                    impacts.push_back(event);
+                }
                 if (B.t - lastRecorded >= 0.03 ||
                     (B.resting && B.t > lastRecorded)) {
                     history.push_back({ B.x, B.y, B.z });
+                    if (!impact) energy.push_back(rockEnergyPoint(B));
                     lastRecorded = B.t;
                 }
             }
@@ -3906,6 +4146,9 @@ inline int run3D(bool embedded, const wchar_t* shotPath, uint32_t seed,
         if (pickingRelease) {
             renderTerrain(guideTerrain, guideCamera);
             ReleaseGuide(guideTerrain, panel.pending).draw(guideCamera, panel.pending);
+        } else if (viewMode == ViewMode::BarrierEnergy) {
+            renderBarrierEnergy({sceneLeft, sceneTop, W - 1, sceneBottom - 1}, energy, impacts,
+                                rockEnergyPoint(B), settings);
         } else {
             const bool together = viewMode == ViewMode::Together;
             if (viewMode != ViewMode::Sections) {
